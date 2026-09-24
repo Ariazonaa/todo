@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Todo</title>
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="offline" hidden data-i18n="offline.banner">Offline — Änderungen sind gerade nicht möglich</div>
+<div id="ptr" aria-hidden="true">
+  <svg class="ic" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6.1"/><polyline points="20.5 2.8 20.5 6.6 16.7 6.6"/></svg>
+</div>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="eyebrow" id="hdr-weekday"></div>
+      <h1 id="hdr-date"></h1>
+      <div class="count" id="hdr-count"></div>
+    </div>
+    <div class="hdr-btns">
+      <button id="toggle-search" class="ghost icon" title="Suchen" aria-label="Suchen" data-i18n-attr="title:search.open;aria-label:search.open">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+      </button>
+      <button id="open-settings" class="ghost icon" title="Einstellungen" aria-label="Einstellungen" data-i18n-attr="title:settings.title;aria-label:settings.title">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <nav id="lists" class="listbar" data-i18n-attr="aria-label:lists.nav" aria-label="Listen"></nav>
+
+  <form id="add-form" autocomplete="off">
+    <div class="add-row">
+      <input id="new-title" type="text" placeholder="Neue Aufgabe…" data-i18n-attr="placeholder:add.placeholder" maxlength="500" enterkeyhint="done">
+      <button id="toggle-details" type="button" class="ghost icon" aria-label="Datum und Wiederholung" data-i18n-attr="aria-label:add.details" aria-expanded="false">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="3"/><line x1="3" y1="9.5" x2="21" y2="9.5"/><line x1="8" y1="3" x2="8" y2="7"/><line x1="16" y1="3" x2="16" y2="7"/></svg>
+      </button>
+      <button type="submit" class="primary icon" aria-label="Aufgabe hinzufügen" data-i18n-attr="aria-label:add.submit">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+    </div>
+    <div class="add-details" id="add-details" hidden>
+      <input id="new-date" type="date" aria-label="Fällig am" placeholder="Datum" data-i18n-attr="aria-label:add.date;placeholder:field.date">
+      <input id="new-time" type="time" aria-label="Uhrzeit" placeholder="Uhrzeit" data-i18n-attr="aria-label:field.time;placeholder:field.time">
+      <select id="new-rec" aria-label="Wiederholung" data-i18n-attr="aria-label:field.repeat">
+        <option value="" data-i18n="add.once">einmalig</option>
+        <option value="daily" data-i18n="rec.daily">täglich</option>
+        <option value="weekly" data-i18n="rec.weekly">wöchentlich</option>
+        <option value="monthly" data-i18n="rec.monthly">monatlich</option>
+      </select>
+    </div>
+  </form>
+
+  <div id="search-row" hidden>
+    <input id="search" type="search" placeholder="Suchen…" data-i18n-attr="placeholder:search.placeholder" autocomplete="off">
+  </div>
+
+  <main id="list" aria-live="polite"></main>
+</div>
+
+<!-- Edit task (iOS sheet) -->
+<dialog id="edit" class="sheet">
+  <div class="grabber" aria-hidden="true"></div>
+  <div class="sheet-head">
+    <button id="edit-cancel" class="textbtn" type="button" data-i18n="common.cancel">Abbrechen</button>
+    <div class="sheet-title" data-i18n="edit.title">Aufgabe</div>
+    <button id="edit-save" class="textbtn strong" type="button" data-i18n="common.save">Speichern</button>
+  </div>
+  <div class="sheet-body">
+    <div class="group">
+      <input id="edit-title" maxlength="500" placeholder="Titel" data-i18n-attr="placeholder:edit.title_ph">
+      <textarea id="edit-note" rows="3" maxlength="5000" placeholder="Notizen" data-i18n-attr="placeholder:edit.notes"></textarea>
+    </div>
+    <div class="group rows">
+      <div class="setrow"><label for="edit-date" data-i18n="edit.due">Fällig</label><input id="edit-date" type="date" placeholder="Datum" data-i18n-attr="placeholder:field.date"></div>
+      <div class="setrow"><label for="edit-time" data-i18n="field.time">Uhrzeit</label><input id="edit-time" type="time" placeholder="Uhrzeit" data-i18n-attr="placeholder:field.time"></div>
+      <div class="setrow" id="list-row"><label for="edit-list" data-i18n="lists.label">Liste</label><select id="edit-list"></select></div>
+      <div class="setrow" id="progress-row"><label id="progress-label" data-i18n="section.in_progress">In Arbeit</label>
+        <button type="button" id="edit-progress" class="switch" role="switch" aria-checked="false" aria-labelledby="progress-label"><span class="knob"></span></button>
+      </div>
+      <div class="setrow" id="pin-row"><label id="pin-label" data-i18n="section.pinned">Angepinnt</label>
+        <button type="button" id="edit-pin" class="switch" role="switch" aria-checked="false" aria-labelledby="pin-label"><span class="knob"></span></button>
+      </div>
+    </div>
+    <div class="group pad" id="rec-wrap">
+      <div class="grouplabel" data-i18n="field.repeat">Wiederholung</div>
+      <div class="segmented" id="edit-rec" role="radiogroup">
+        <button type="button" data-v="" role="radio" data-i18n="edit.rec.never">Nie</button>
+        <button type="button" data-v="daily" role="radio" data-i18n="edit.rec.daily">Täglich</button>
+        <button type="button" data-v="weekly" role="radio" data-i18n="edit.rec.weekly">Wöchentl.</button>
+        <button type="button" data-v="monthly" role="radio" data-i18n="edit.rec.monthly">Monatl.</button>
+      </div>
+    </div>
+    <div class="group pad" id="prio-wrap">
+      <div class="grouplabel" data-i18n="prio.title">Priorität</div>
+      <div class="segmented" id="edit-prio" role="radiogroup">
+        <button type="button" data-v="0" role="radio" data-i18n="prio.none">Keine</button>
+        <button type="button" data-v="1" role="radio" data-i18n="prio.low">Niedrig</button>
+        <button type="button" data-v="2" role="radio" data-i18n="prio.medium">Mittel</button>
+        <button type="button" data-v="3" role="radio" data-i18n="prio.high">Hoch</button>
+      </div>
+    </div>
+    <div class="group pad btnwrap">
+      <button type="button" id="snooze-1" class="ghost pill">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><polyline points="5 6 11 12 5 18"/><polyline points="12 6 18 12 12 18"/></svg>
+        <span data-i18n="snooze.day">+1 Tag</span></button>
+      <button type="button" id="snooze-7" class="ghost pill">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><polyline points="5 6 11 12 5 18"/><polyline points="12 6 18 12 12 18"/></svg>
+        <span data-i18n="snooze.week">+1 Woche</span></button>
+    </div>
+    <div id="parent-wrap" class="group rows">
+      <div class="setrow"><label for="edit-parent" data-i18n="edit.parent">Unteraufgabe von</label><select id="edit-parent"></select></div>
+    </div>
+    <div id="subs-wrap">
+      <h3><span data-i18n="edit.subtasks">Unteraufgaben</span> <span id="sub-count"></span></h3>
+      <div class="group">
+        <ul id="sub-list"></ul>
+        <div class="addline"><input id="new-sub" placeholder="Neue Unteraufgabe" data-i18n-attr="placeholder:edit.new_sub" maxlength="500"><button id="add-sub" class="textbtn strong" type="button" data-i18n="common.add">Hinzufügen</button></div>
+      </div>
+    </div>
+    <div id="attach-wrap">
+      <h3 data-i18n="edit.images">Bilder</h3>
+      <div class="group pad">
+        <div id="attach-grid"></div>
+        <div class="btn-row">
+          <button id="add-attach" class="ghost pill" type="button" data-i18n="edit.add_image">+ Bild hinzufügen</button>
+          <input type="file" id="attach-file" accept="image/*" multiple hidden>
+        </div>
+      </div>
+    </div>
+    <div id="links-wrap">
+      <h3 data-i18n="edit.links">Verknüpft</h3>
+      <div class="group">
+        <ul id="link-list"></ul>
+        <div class="addline"><select id="link-select"></select><button id="add-link" class="textbtn strong" type="button" data-i18n="edit.link">Verknüpfen</button></div>
+      </div>
+    </div>
+    <div class="group pad">
+      <button id="edit-delete" class="pill danger-fill wide" type="button" data-i18n="edit.delete">Aufgabe löschen</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Settings (iOS sheet) -->
+<dialog id="settings" class="sheet">
+  <div class="grabber" aria-hidden="true"></div>
+  <div class="sheet-head">
+    <span></span>
+    <div class="sheet-title" data-i18n="settings.title">Einstellungen</div>
+    <button id="close-settings" class="textbtn strong" type="button" data-i18n="common.done">Fertig</button>
+  </div>
+  <div class="sheet-body">
+    <form id="settings-form">
+      <h3 data-i18n="settings.reminders">Erinnerungen</h3>
+      <div class="group rows">
+        <div class="setrow col"><label for="set-webhook" data-i18n="settings.webhook">Discord-Webhook</label>
+          <input id="set-webhook" type="url" placeholder="https://discord.com/api/webhooks/… (leer = aus)" data-i18n-attr="placeholder:settings.webhook_ph"></div>
+        <div class="setrow"><label for="set-tz" data-i18n="settings.tz">Zeitzone</label><input id="set-tz" list="tz-list" required></div>
+        <div class="setrow"><label for="set-digest" data-i18n="settings.digest">Digest um</label><input id="set-digest" type="time" required></div>
+        <div class="setrow" id="archive-row"><label for="set-archive" data-i18n="settings.archive">Erledigte löschen nach</label>
+          <span class="inline-unit"><input id="set-archive" type="number" min="0" max="3650" required> <span data-i18n="settings.archive_unit">Tagen</span></span></div>
+      </div>
+      <datalist id="tz-list">
+        <option value="Europe/Berlin"></option>
+        <option value="Europe/Vienna"></option>
+        <option value="Europe/Zurich"></option>
+        <option value="UTC"></option>
+      </datalist>
+      <div class="btn-row">
+        <button type="submit" class="primary pill" data-i18n="common.save">Speichern</button>
+        <button type="button" id="test-webhook" class="ghost pill" data-i18n="settings.test_ping">Test-Ping</button>
+      </div>
+    </form>
+    <h3 data-i18n="push.title">Push auf diesem Gerät</h3>
+    <div class="group rows">
+      <div class="setrow"><label id="push-label" data-i18n="push.notifications">Benachrichtigungen</label>
+        <button type="button" id="push-toggle" class="switch" role="switch" aria-checked="false" aria-labelledby="push-label"><span class="knob"></span></button>
+      </div>
+    </div>
+    <p id="push-hint" class="hint push-hint" hidden></p>
+    <div class="btn-row">
+      <button type="button" id="push-test" class="ghost pill" hidden data-i18n="push.test">Test senden</button>
+    </div>
+    <h3 data-i18n="stats.title">Statistik</h3>
+    <div class="group stats" id="stats-box"></div>
+    <h3 data-i18n="passkeys.title">Passkeys</h3>
+    <div class="group">
+      <ul id="passkey-list"></ul>
+      <div class="addline"><input id="passkey-name" placeholder="Gerätename (optional)" data-i18n-attr="placeholder:passkeys.name_ph" maxlength="60"><button id="add-passkey" class="textbtn strong" type="button" data-i18n="common.add">Hinzufügen</button></div>
+    </div>
+    <div id="users-wrap" hidden>
+      <h3 data-i18n="users.title">Nutzer</h3>
+      <div class="group">
+        <ul id="user-list"></ul>
+        <div class="addline"><input id="user-name" maxlength="40" autocomplete="off" data-i18n-attr="placeholder:users.name_ph" placeholder="Name"><button id="add-user" class="textbtn strong" type="button" data-i18n="common.add">Hinzufügen</button></div>
+      </div>
+    </div>
+    <h3 data-i18n="settings.app">App</h3>
+    <div class="group rows">
+      <div class="setrow"><label id="sound-label" data-i18n="settings.sound">Sound beim Abhaken</label>
+        <button type="button" id="set-sound" class="switch" role="switch" aria-checked="true" aria-labelledby="sound-label"><span class="knob"></span></button>
+      </div>
+      <div class="setrow"><label for="set-lang" data-i18n="settings.language">Sprache</label><select id="set-lang"></select></div>
+    </div>
+    <h3 data-i18n="settings.data">Daten</h3>
+    <div class="btn-row">
+      <button id="export-btn" class="ghost pill" type="button" data-i18n="backup.export">Backup exportieren</button>
+      <button id="import-btn" class="ghost pill" type="button" data-i18n="backup.import">Importieren…</button>
+      <input type="file" id="import-file" accept="application/json,.json" hidden>
+    </div>
+    <h3 data-i18n="settings.session">Sitzung</h3>
+    <div class="btn-row">
+      <button id="logout" class="ghost pill" type="button" data-i18n="session.logout">Abmelden</button>
+      <button id="logout-all" class="ghost pill dangerbtn" type="button" data-i18n="session.logout_all">Überall abmelden</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="lightbox">
+  <button id="lightbox-close" aria-label="Schließen" data-i18n-attr="aria-label:common.close">
+    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+  </button>
+  <img id="lightbox-img" alt="Bild-Anhang" data-i18n-attr="alt:image.alt">
+</dialog>
+
+<dialog id="confirm-dialog" class="confirm">
+  <p id="confirm-text"></p>
+  <div class="confirm-btns">
+    <button id="confirm-ok" class="danger-text" data-i18n="common.delete">Löschen</button>
+    <button id="confirm-cancel" data-i18n="common.cancel">Abbrechen</button>
+  </div>
+</dialog>
+
+<dialog id="list-dialog" class="confirm">
+  <p id="list-dialog-title"></p>
+  <div class="list-dialog-body"><input id="list-name" maxlength="40" autocomplete="off" data-i18n-attr="placeholder:lists.name_ph" placeholder="Name der Liste"></div>
+  <div id="list-share" hidden>
+    <p class="list-share-title" data-i18n="lists.shared_with">Geteilt mit</p>
+    <ul id="list-members"></ul>
+    <div class="addline" id="share-line"><select id="share-person"></select><button id="share-add" class="textbtn strong" type="button" data-i18n="lists.share">Teilen</button></div>
+    <p id="share-none" class="hint" hidden data-i18n="lists.share_none">Es gibt keine weiteren Konten.</p>
+  </div>
+  <div class="confirm-btns">
+    <button id="list-save" type="button" data-i18n="common.save">Speichern</button>
+    <button id="list-delete" type="button" class="danger-text" data-i18n="lists.delete">Liste löschen</button>
+    <button id="list-leave" type="button" class="danger-text" hidden data-i18n="lists.leave">Liste verlassen</button>
+    <button id="list-cancel" type="button" data-i18n="common.cancel">Abbrechen</button>
+  </div>
+</dialog>
+
+<dialog id="choice-dialog" class="confirm">
+  <p id="choice-text"></p>
+  <div class="confirm-btns" id="choice-btns"></div>
+</dialog>
+
+<div id="toast" popover="manual" hidden></div>
+<script src="/i18n.js"></script>
+<script src="/webauthn.js"></script>
+<script src="/dateparse.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

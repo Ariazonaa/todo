@@ -1,0 +1,13 @@
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+todo
+todo.exe
+.claude/
+.playwright-mcp/
+node_modules/
+test-results/
+playwright-report/
+CLAUDE.md

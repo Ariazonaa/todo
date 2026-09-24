@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title data-i18n="login.page_title">Todo — Anmelden</title>
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="login">
+  <form id="login-form">
+    <div class="eyebrow">Todo</div>
+    <h1 data-i18n="login.title">Anmelden</h1>
+    <button type="submit" class="primary wide">
+      <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+      <span data-i18n="login.button">Mit Passkey anmelden</span></button>
+    <a href="/setup" class="joinlink" data-i18n="login.join">Konto einrichten</a>
+    <p id="err" class="error" hidden></p>
+  </form>
+</main>
+<script src="/i18n.js"></script>
+<script src="/webauthn.js"></script>
+<script src="/login-page.js"></script>
+</body>
+</html>

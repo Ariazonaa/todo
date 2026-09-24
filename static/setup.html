@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title data-i18n="setup.page_title">Todo — Einrichtung</title>
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="/icons/icon-192.png">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="login">
+  <form id="setup-form">
+    <div class="eyebrow">Todo</div>
+    <h1 data-i18n="setup.title">Willkommen</h1>
+    <p class="hint" data-i18n="setup.hint">Diese Instanz gehört noch niemandem. Richte jetzt deinen
+    Passkey ein — wer das zuerst tut, verwaltet die Instanz. Den Setup-Code
+    findest du im Server-Log (<code data-i18n-slot="cmd">docker compose logs todo</code>) oder in
+    <code data-i18n-slot="file">data/setup-code.txt</code>.</p>
+    <input type="text" id="setup-code" placeholder="Setup-Code (XXXX-XXXX-XXXX-XXXX)" data-i18n-attr="placeholder:setup.code_ph" required autocomplete="off" autocapitalize="characters" spellcheck="false">
+    <input type="text" id="device-name" placeholder="Gerätename (optional, z.B. „Handy“)" data-i18n-attr="placeholder:setup.device_ph" maxlength="60" autocomplete="off">
+    <button type="submit" class="primary wide" data-i18n="setup.button">Passkey erstellen</button>
+    <p id="err" class="error" hidden></p>
+  </form>
+</main>
+<script src="/i18n.js"></script>
+<script src="/webauthn.js"></script>
+<script src="/setup-page.js"></script>
+</body>
+</html>

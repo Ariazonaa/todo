@@ -1,0 +1,38 @@
+# Nothing is built on the server: this pulls the image that CI built and
+# scanned. `docker compose up -d` always fetches the newest :latest.
+services:
+  todo:
+    image: ghcr.io/ariazonaa/todo:latest
+    pull_policy: always
+    container_name: todo
+    # Bound to localhost only: the reverse proxy on this host forwards to it.
+    # Published on all interfaces, the port would bypass the host firewall and
+    # anyone could set X-Real-IP (rate limiting) themselves.
+    ports:
+      - 127.0.0.1:8080:8080
+    restart: unless-stopped
+    # On shutdown the app waits up to 15s for open requests and 12s for the
+    # scheduler; Docker's default of 10s would cut that short.
+    stop_grace_period: 30s
+    volumes:
+      - ./data:/data
+    # Hardening: the app only writes to /data (SQLite) and needs no
+    # capabilities (port 8080, user 10001). /tmp as tmpfs for SQLite's temp
+    # files, which would otherwise fail on the read-only filesystem.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Limits so a runaway doesn't take the host down. Measured: ~225 MB peak
+    # while importing a large backup, far less in normal operation.
+    mem_limit: 1g
+    pids_limit: 256
+    # Rotate logs — the default driver grows without bound.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

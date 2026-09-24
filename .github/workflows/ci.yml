@@ -1,0 +1,91 @@
+# Tests on every push and pull request. On main the image is built, scanned
+# and pushed to ghcr.io as :<sha12> and :latest; a release tag vX.Y.Z also
+# pushes :X.Y.Z, :X.Y and :X. Servers pull :latest (docker-compose.yml) or pin
+# a version — there is no deploy job.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      # -race needs cgo; the shipped binary is built without it (Dockerfile).
+      - run: CGO_ENABLED=1 go test -race ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      # Browser smoke test: setup, quick add, sharing, sign-in with a virtual
+      # passkey — what the Go tests can't see.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm test
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      # Only for the OCI labels (image.revision tells which commit is running).
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: todo:scan
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Scan image
+        # Third-party action with access to the workflow: pinned to a commit.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: todo:scan
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tags=("$(echo "$GITHUB_SHA" | cut -c1-12)")
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            tags+=(latest)
+          else
+            v="${GITHUB_REF#refs/tags/v}"   # 1.2.3 -> :1.2.3, :1.2, :1
+            tags+=("$v" "${v%.*}" "${v%%.*}")
+          fi
+          for tag in "${tags[@]}"; do
+            docker tag todo:scan "$repo:$tag"
+            docker push "$repo:$tag"
+          done
