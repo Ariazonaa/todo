@@ -590,6 +590,40 @@ test('Priorität per Schnelleingabe und im Sheet', async () => {
   await expect(kreis).toHaveClass(/prio-1/);
 });
 
+// The sheet only saves what it changed: a note written elsewhere in the
+// meantime (another device) survives, and shows up in the open sheet. Esc
+// asks before discarding input.
+test('Sheet: fremde Änderungen bleiben, Esc fragt nach', async () => {
+  const zeile = page.locator('#list li.task', { hasText: 'Steuererklärung' }).first();
+  const id = Number(await zeile.getAttribute('data-id'));
+  await zeile.locator('.body').first().click();
+  await expect(page.locator('#edit')).toBeVisible();
+  await page.evaluate((id) => fetch(`/api/tasks/${id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: 'vom Handy' }),
+  }), id);
+  await expect(page.locator('#edit-note')).toHaveValue('vom Handy');
+
+  await page.fill('#edit-title', 'Steuererklärung 2026');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#confirm-dialog')).toBeVisible();
+  await page.click('#confirm-cancel');
+  await expect(page.locator('#edit')).toBeVisible();
+  await expect(page.locator('#edit-title')).toHaveValue('Steuererklärung 2026');
+
+  await page.click('#edit-save');
+  await beruhigen();
+  const task = await page.evaluate(async (id) => (await (await fetch('/api/tasks')).json()).tasks.find((t) => t.id === id), id);
+  expect(task.title).toBe('Steuererklärung 2026');
+  expect(task.note).toBe('vom Handy');
+
+  await zeile.locator('.body').first().click();
+  await page.fill('#edit-title', 'verworfen');
+  await page.keyboard.press('Escape');
+  await page.click('#confirm-ok');
+  await expect(page.locator('#edit')).toBeHidden();
+  await expect(zeile.locator('.title').first()).toHaveText('Steuererklärung 2026');
+});
+
 // Admin creates an account; a second person sets it up with the code in
 // their own browser context and sees only their own data.
 test('Konten: anlegen, einrichten, getrennt, entfernen', async ({ browser }) => {
@@ -673,7 +707,8 @@ test('Geteilte Liste: teilen, gemeinsam abhaken, verlassen', async ({ browser })
   await page.locator('#lists .listchip', { hasText: 'WG' }).click({ button: 'right' });
   await page.selectOption('#share-person', { label: 'Cleo' });
   await page.click('#share-add');
-  await expect(page.locator('#list-members li', { hasText: 'Cleo' })).toBeVisible();
+  // Sharing is an invitation: Cleo is listed, but as invited
+  await expect(page.locator('#list-members li', { hasText: 'Cleo' })).toContainText('eingeladen');
   await page.click('#list-cancel');
 
   const ctx = await browser.newContext();
@@ -687,6 +722,13 @@ test('Geteilte Liste: teilen, gemeinsam abhaken, verlassen', async ({ browser })
   await cleo.fill('#setup-code', code);
   await cleo.click('#setup-form button[type=submit]');
   await expect(cleo).toHaveURL(/\/$/);
+  // Until Cleo accepts, the list and its tasks stay hidden
+  const einladung = cleo.locator('#invites .invite', { hasText: 'WG' });
+  await expect(einladung).toContainText('Admin');
+  await expect(cleo.locator('#lists .listchip', { hasText: 'WG' })).toHaveCount(0);
+  await expect(cleo.locator('#list li.task', { hasText: 'Bad putzen' })).toHaveCount(0);
+  await einladung.locator('button', { hasText: 'Annehmen' }).click();
+  await expect(cleo.locator('#invites')).toBeHidden();
   await expect(cleo.locator('#lists .listchip.shared', { hasText: 'WG' })).toBeVisible();
   const zeile = cleo.locator('#list li.task', { hasText: 'Bad putzen' });
   await expect(zeile).toBeVisible();

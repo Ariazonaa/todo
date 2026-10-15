@@ -84,6 +84,10 @@ func (s *server) changed(uid int64, extra ...int64) {
 		}
 	}
 	rows.Close()
+	if rows.Err() != nil {
+		s.hub.notifyAll()
+		return
+	}
 	s.hub.notifyUsers(uids)
 }
 
@@ -91,19 +95,30 @@ func (s *server) changed(uid int64, extra ...int64) {
 // NATs alive; the session is also checked on every beat.
 var sseHeartbeat = 25 * time.Second
 
+// sseStreams: open streams per person. Every stream checks the session on
+// each heartbeat — thousands of them would keep the single DB connection
+// busy. 16 is plenty for one person's tabs and devices.
+var sseStreams = newUserSlots(16)
+
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, r, http.StatusInternalServerError, "error.streaming")
 		return
 	}
+	uid := userID(r)
+	if !sseStreams.acquire(uid) {
+		writeError(w, r, http.StatusTooManyRequests, "error.rate_limited")
+		return
+	}
+	defer sseStreams.release(uid)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	fmt.Fprint(w, "retry: 3000\n\n")
 	flusher.Flush()
 
-	ch := s.hub.subscribe(userID(r))
+	ch := s.hub.subscribe(uid)
 	defer s.hub.unsubscribe(ch)
 	heartbeat := time.NewTicker(sseHeartbeat)
 	defer heartbeat.Stop()

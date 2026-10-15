@@ -1,6 +1,6 @@
 module github.com/ariazonaa/todo
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/go-webauthn/webauthn v0.17.4

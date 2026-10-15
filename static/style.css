@@ -248,6 +248,21 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
   -webkit-touch-callout: none;
 }
 .listchip.active { border-color: var(--tint); color: var(--tint); font-weight: 600; }
+/* Invitations to shared lists: black card with a thin line, like the list */
+#invites { display: grid; gap: 0.5rem; margin-bottom: 0.7rem; }
+.invite {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--radius-group);
+  background: #000;
+}
+.invite > .ic { flex: none; color: var(--tint); }
+.invite-text { flex: 1; min-width: 0; font-size: 0.92rem; line-height: 1.35; }
+.invite-btns { flex: none; display: flex; gap: 0.8rem; }
+.invite-btns .textbtn { font-size: 0.92rem; }
 .list-dialog-body { padding: 0 1.2rem 1rem; }
 .list-dialog-body input { width: 100%; }
 
@@ -963,12 +978,13 @@ dialog.confirm p {
   box-shadow: 0 12px 24px -10px rgba(224, 68, 58, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.4);
 }
 
-/* Fallbacks: opaque without backdrop-filter, or with reduced transparency */
+/* Fallbacks: opaque without backdrop-filter, or with reduced transparency —
+   still AMOLED black (cards stay #000; input fill = its look on black) */
 @supports not ((backdrop-filter: blur(4px)) or (-webkit-backdrop-filter: blur(4px))) {
-  :root { --glass: rgba(30, 33, 42, 0.96); --glass-strong: rgba(24, 26, 34, 0.98); --glass-input: rgba(44, 48, 60, 0.96); }
+  :root { --glass-strong: #000; --glass-input: #1c1c1f; }
 }
 @media (prefers-reduced-transparency: reduce) {
-  :root { --glass: rgba(30, 33, 42, 0.98); --glass-strong: rgba(24, 26, 34, 0.99); --glass-input: rgba(44, 48, 60, 0.98); }
+  :root { --glass-strong: #000; --glass-input: #1c1c1f; }
   #add-form, #list section, #list details, .login form, #toast, #offline, dialog {
     -webkit-backdrop-filter: none;
     backdrop-filter: none;

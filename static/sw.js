@@ -1,5 +1,5 @@
 // Bump this on every frontend change, otherwise offline usage gets stuck on the old version.
-const CACHE = 'todo-v41';
+const CACHE = 'todo-v43';
 const ASSETS = [
   '/style.css',
   '/i18n.js',
@@ -44,19 +44,24 @@ self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET' || url.origin !== location.origin || url.pathname.startsWith('/api/')) {
     return;
   }
+  // Navigations are all the same shell: cached under '/' only, otherwise
+  // every /?task=<id> from a notification would add another copy.
+  const navigate = e.request.mode === 'navigate';
+  const key = navigate && url.pathname === '/' ? '/' : e.request;
   e.respondWith(
     fetch(e.request)
       .then((res) => {
         if (res.ok && !res.redirected) {
           const clone = res.clone();
-          caches.open(CACHE).then((c) => c.put(e.request, clone));
+          // waitUntil: the worker may otherwise be stopped before the write
+          e.waitUntil(caches.open(CACHE).then((c) => c.put(key, clone)).catch(() => {}));
         }
         return res;
       })
       .catch(async () => {
-        const m = await caches.match(e.request);
+        const m = await caches.match(key);
         if (m) return m;
-        if (e.request.mode === 'navigate') {
+        if (navigate) {
           const shell = await caches.match('/');
           if (shell) return shell;
           // The worker doesn't know the catalog — the device's language is good enough.
@@ -98,7 +103,12 @@ self.addEventListener('push', (e) => {
 
 async function openApp(taskId) {
   const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-  const win = wins.find((w) => new URL(w.url).origin === location.origin);
+  // Only a window of the app itself — on /login or /setup nobody listens for
+  // open-task, the task would never open.
+  const win = wins.find((w) => {
+    const u = new URL(w.url);
+    return u.origin === location.origin && u.pathname === '/';
+  });
   if (win) {
     await win.focus();
     if (taskId) win.postMessage({ type: 'open-task', id: taskId });

@@ -60,11 +60,13 @@ CREATE TABLE IF NOT EXISTS links (
 	b INTEGER NOT NULL,
 	PRIMARY KEY (a, b)
 );
--- members of shared lists (the owner is lists.owner_id)
+-- members of shared lists (the owner is lists.owner_id); accepted_at NULL =
+-- invitation not yet accepted (no access until then)
 CREATE TABLE IF NOT EXISTS list_members (
-	list_id  INTEGER NOT NULL,
-	user_id  INTEGER NOT NULL,
-	added_at TEXT NOT NULL,
+	list_id     INTEGER NOT NULL,
+	user_id     INTEGER NOT NULL,
+	added_at    TEXT NOT NULL,
+	accepted_at TEXT,
 	PRIMARY KEY (list_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_list_members_user ON list_members(user_id);
@@ -144,10 +146,12 @@ CREATE TABLE IF NOT EXISTS attachments (
 // Import staging area: images are stored here one at a time as they're read
 // in and only committed at the end in a short transaction. This way the
 // whole backup is never held in memory, and the single DB connection isn't
-// locked for the duration of an upload.
+// locked for the duration of an upload. user_id: imports of different
+// people run side by side, each only touches its own rows.
 const importAttachmentsTable = `
 CREATE TABLE IF NOT EXISTS import_attachments (
 	seq        INTEGER PRIMARY KEY,
+	user_id    INTEGER NOT NULL,
 	task_id    INTEGER NOT NULL,
 	mime       TEXT NOT NULL,
 	created_at TEXT NOT NULL,
@@ -183,6 +187,9 @@ type Task struct {
 	Overdue     bool    `json:"overdue"`
 	Links       []int64 `json:"links"`
 	Attachments []int64 `json:"attachments"`
+	// CompletedBy: who checked the task off — their stats get the reopen
+	// back (shared lists). nil = unknown (legacy), 0 = account deleted.
+	CompletedBy *int64 `json:"-"`
 }
 
 func openDB(path string) (*sql.DB, error) {
@@ -193,6 +200,26 @@ func openDB(path string) (*sql.DB, error) {
 	}
 	// A single writer: HTTP handlers and the scheduler can never produce SQLITE_BUSY for each other.
 	db.SetMaxOpenConns(1)
+	// The staging area holds nothing between two imports: an old one without
+	// user_id is simply rebuilt.
+	var stagingOld int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('import_attachments')").Scan(&stagingOld); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if stagingOld > 0 {
+		var hasUser int
+		if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('import_attachments') WHERE name = 'user_id'").Scan(&hasUser); err != nil {
+			db.Close()
+			return nil, err
+		}
+		if hasUser == 0 {
+			if _, err := db.Exec("DROP TABLE import_attachments"); err != nil {
+				db.Close()
+				return nil, err
+			}
+		}
+	}
 	for _, stmt := range []string{schema, attachmentsTable, importAttachmentsTable, attachmentsTrigger} {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
@@ -272,6 +299,27 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if ok, err := colExists("tasks", "completed_by"); err != nil {
+		return err
+	} else if !ok {
+		if _, err := db.Exec("ALTER TABLE tasks ADD COLUMN completed_by INTEGER"); err != nil {
+			return err
+		}
+	}
+	// Invitations: memberships from before were active, so they count as
+	// accepted.
+	if ok, err := colExists("list_members", "accepted_at"); err != nil {
+		return err
+	} else if !ok {
+		for _, stmt := range []string{
+			"ALTER TABLE list_members ADD COLUMN accepted_at TEXT",
+			"UPDATE list_members SET accepted_at = added_at",
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				return err
+			}
+		}
+	}
 	if err := migrateSingleUser(db); err != nil {
 		return err
 	}
@@ -295,10 +343,10 @@ func migrate(db *sql.DB) error {
 		{"CREATE TRIGGER tasks_default_list AFTER INSERT ON tasks WHEN NEW.list_id IS NULL " +
 			"BEGIN UPDATE tasks SET list_id = (SELECT id FROM lists WHERE is_default = 1 ORDER BY id LIMIT 1) WHERE id = NEW.id; END", nil},
 		// Who may see which list — the single place for visibility: owner and
-		// members.
+		// members who accepted the invitation.
 		{"DROP VIEW IF EXISTS list_access", nil},
 		{"CREATE VIEW list_access AS SELECT id AS list_id, owner_id AS user_id FROM lists " +
-			"UNION SELECT list_id, user_id FROM list_members", nil},
+			"UNION SELECT list_id, user_id FROM list_members WHERE accepted_at IS NOT NULL", nil},
 		{"DROP INDEX IF EXISTS idx_lists_name_key", nil},
 	} {
 		if _, err := db.Exec(q.sql, q.args...); err != nil {
@@ -484,18 +532,21 @@ func migrateAttachmentsAutoincrement(db *sql.DB) error {
 	return tx.Commit()
 }
 
-const taskCols = "id, title, due_date, due_time, recurrence, done, created_at, completed_at, parent_id, note, pinned, sort_order, in_progress, priority, list_id"
+const taskCols = "id, title, due_date, due_time, recurrence, done, created_at, completed_at, parent_id, note, pinned, sort_order, in_progress, priority, list_id, completed_by"
 
 func scanTask(row interface{ Scan(...any) error }) (Task, error) {
 	var t Task
 	var due, dueTime, completed sql.NullString
-	var parent, list sql.NullInt64
+	var parent, list, completedBy sql.NullInt64
 	var done, pinned, inProgress int
-	err := row.Scan(&t.ID, &t.Title, &due, &dueTime, &t.Recurrence, &done, &t.CreatedAt, &completed, &parent, &t.Note, &pinned, &t.SortOrder, &inProgress, &t.Priority, &list)
+	err := row.Scan(&t.ID, &t.Title, &due, &dueTime, &t.Recurrence, &done, &t.CreatedAt, &completed, &parent, &t.Note, &pinned, &t.SortOrder, &inProgress, &t.Priority, &list, &completedBy)
 	if err != nil {
 		return t, err
 	}
 	t.ListID = list.Int64
+	if completedBy.Valid {
+		t.CompletedBy = &completedBy.Int64
+	}
 	t.Done = done != 0
 	t.Pinned = pinned != 0
 	t.InProgress = inProgress != 0
@@ -576,10 +627,10 @@ func listTasks(db *sql.DB, uid int64, now time.Time) ([]Task, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if err := attachLinks(db, tasks); err != nil {
+	if err := attachLinks(db, uid, tasks); err != nil {
 		return nil, err
 	}
-	if err := attachAttachments(db, tasks); err != nil {
+	if err := attachAttachments(db, uid, tasks); err != nil {
 		return nil, err
 	}
 	sort.SliceStable(tasks, func(i, j int) bool {
@@ -615,35 +666,60 @@ func listTasks(db *sql.DB, uid int64, now time.Time) ([]Task, error) {
 // still saw the old state.
 var errParentInvalid = errors.New("parent missing or not top-level")
 
+// errTaskLimit: the target list's owner already has maxTasksPerOwner tasks.
+var errTaskLimit = errors.New("task limit reached")
+
+// ownerTaskCount: SQL for the number of tasks in all lists of the owner of
+// the list given by the SQL expression list.
+func ownerTaskCount(list string) string {
+	return "(SELECT COUNT(*) FROM tasks WHERE list_id IN (SELECT id FROM lists WHERE owner_id = (SELECT owner_id FROM lists WHERE id = " + list + ")))"
+}
+
 func createTask(db *sql.DB, uid int64, title string, dueDate, dueTime *string, recurrence, note string, pinned bool, priority int, listID, parentID *int64) (Task, error) {
 	created := time.Now().UTC().Format(time.RFC3339)
-	// One statement instead of check-then-write: the one-level rule and the
-	// list are enforced within the INSERT itself, otherwise a second device
-	// could reparent or delete the parent task or the list in between.
+	// One statement instead of check-then-write: the one-level rule, the
+	// list and the owner's task limit are enforced within the INSERT itself,
+	// otherwise a second device could reparent or delete the parent task or
+	// the list in between (or push the owner past the limit).
 	// Subtasks live in their parent task's list (a given one then doesn't
 	// count), otherwise the given one, or the default list if none is given.
 	// New tasks land at the end of their list — subtasks at the end of their
-	// siblings.
-	res, err := db.Exec(
-		"INSERT INTO tasks (title, due_date, due_time, recurrence, created_at, note, pinned, priority, list_id, parent_id, sort_order) "+
-			"SELECT ?, ?, ?, ?, ?, ?, ?, ?, "+
-			"CASE WHEN ? IS NOT NULL THEN (SELECT list_id FROM tasks WHERE id = ?) WHEN ? IS NOT NULL THEN ? "+
-			"ELSE (SELECT id FROM lists WHERE owner_id = ? AND is_default = 1) END, "+
-			"?, (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM tasks WHERE parent_id IS ?) "+
-			// Parent task and list must be visible to uid — within the INSERT itself.
-			"WHERE (? IS NULL OR EXISTS (SELECT 1 FROM tasks WHERE id = ? AND parent_id IS NULL AND list_id "+visibleLists+")) "+
-			"AND (? IS NOT NULL OR ? IS NULL OR ? "+visibleLists+")",
-		title, dueDate, dueTime, recurrence, created, note, boolInt(pinned), priority,
-		parentID, parentID, listID, listID, uid,
-		parentID, parentID,
+	// siblings; the position only looks at tasks uid can see.
+	const target = "CASE WHEN ? IS NOT NULL THEN (SELECT list_id FROM tasks WHERE id = ?) WHEN ? IS NOT NULL THEN ? " +
+		"ELSE (SELECT id FROM lists WHERE owner_id = ? AND is_default = 1) END"
+	targetArgs := []any{parentID, parentID, listID, listID, uid}
+	args := []any{title, dueDate, dueTime, recurrence, created, note, boolInt(pinned), priority}
+	args = append(args, targetArgs...)
+	args = append(args, parentID, parentID, uid,
 		parentID, parentID, uid,
 		parentID, listID, listID, uid)
+	args = append(args, targetArgs...)
+	args = append(args, targetArgs...)
+	args = append(args, maxTasksPerOwner)
+	res, err := db.Exec(
+		"INSERT INTO tasks (title, due_date, due_time, recurrence, created_at, note, pinned, priority, list_id, parent_id, sort_order) "+
+			"SELECT ?, ?, ?, ?, ?, ?, ?, ?, "+target+", "+
+			"?, (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM tasks WHERE parent_id IS ? AND list_id "+visibleLists+") "+
+			// Parent task and list must be visible to uid — within the INSERT itself.
+			"WHERE (? IS NULL OR EXISTS (SELECT 1 FROM tasks WHERE id = ? AND parent_id IS NULL AND list_id "+visibleLists+")) "+
+			"AND (? IS NOT NULL OR ? IS NULL OR ? "+visibleLists+") "+
+			// Never fall through to the tasks_default_list trigger (the admin's list).
+			"AND "+target+" IS NOT NULL "+
+			"AND "+ownerTaskCount(target)+" < ?",
+		args...)
 	if err != nil {
 		return Task{}, err
 	}
 	if n, err := res.RowsAffected(); err != nil {
 		return Task{}, err
 	} else if n == 0 {
+		var full bool
+		if err := db.QueryRow("SELECT "+ownerTaskCount(target)+" >= ?", append(append([]any{}, targetArgs...), maxTasksPerOwner)...).Scan(&full); err != nil {
+			return Task{}, err
+		}
+		if full {
+			return Task{}, errTaskLimit
+		}
 		if parentID == nil {
 			return Task{}, errListInvalid
 		}
@@ -682,8 +758,14 @@ func isOverdue(t Task, today, hhmm string) bool {
 
 // Links (peer relationships, normalized a < b)
 
-func attachLinks(db *sql.DB, tasks []Task) error {
-	rows, err := db.Query("SELECT a, b FROM links")
+// visibleTaskIDs: the IDs of all tasks uid can see (one placeholder).
+const visibleTaskIDs = "SELECT id FROM tasks WHERE list_id " + visibleLists
+
+// attachLinks and attachAttachments only read rows of uid's tasks — not
+// those of the whole instance, which someone else's link flood would
+// otherwise make slow for everyone.
+func attachLinks(db *sql.DB, uid int64, tasks []Task) error {
+	rows, err := db.Query("SELECT a, b FROM links WHERE a IN ("+visibleTaskIDs+") AND b IN ("+visibleTaskIDs+")", uid, uid)
 	if err != nil {
 		return err
 	}
@@ -709,8 +791,8 @@ func attachLinks(db *sql.DB, tasks []Task) error {
 	return rows.Err()
 }
 
-func attachAttachments(db *sql.DB, tasks []Task) error {
-	rows, err := db.Query("SELECT id, task_id FROM attachments ORDER BY id")
+func attachAttachments(db *sql.DB, uid int64, tasks []Task) error {
+	rows, err := db.Query("SELECT id, task_id FROM attachments WHERE task_id IN ("+visibleTaskIDs+") ORDER BY id", uid)
 	if err != nil {
 		return err
 	}
@@ -738,13 +820,57 @@ func normalizePair(a, b int64) (int64, int64) {
 	return a, b
 }
 
+// maxLinksPerTask: links are free to create and every task list request
+// reads them — without an upper bound a single account could inflate them
+// at will. Counted per viewer (visibleLinks): links a member of a shared
+// list made to their own tasks are invisible to the owner and mustn't use
+// up the owner's budget.
+const maxLinksPerTask = 100
+
+var errLinkLimit = errors.New("link limit reached")
+
+// visibleLinks: SQL for the number of links of a task (one placeholder)
+// whose other end uid (two placeholders) can see.
+const visibleLinks = "(SELECT COUNT(*) FROM links WHERE (a = ? AND b IN (" + visibleTaskIDs + ")) OR (b = ? AND a IN (" + visibleTaskIDs + ")))"
+
 func linkTasks(db *sql.DB, uid, a, b int64) error {
 	a, b = normalizePair(a, b)
 	// Only if both tasks still exist and are visible to uid at write time: a
 	// link to a task deleted concurrently would otherwise be inherited by the
-	// next new task — tasks.id gets reused.
-	_, err := db.Exec("INSERT OR IGNORE INTO links (a, b) SELECT ?, ? WHERE (SELECT COUNT(*) FROM tasks WHERE id IN (?, ?) AND list_id "+visibleLists+") = 2",
-		a, b, a, b, uid)
+	// next new task — tasks.id gets reused. The limit is part of the write
+	// too.
+	const both = "(SELECT COUNT(*) FROM tasks WHERE id IN (?, ?) AND list_id " + visibleLists + ") = 2"
+	res, err := db.Exec("INSERT OR IGNORE INTO links (a, b) SELECT ?, ? WHERE "+both+
+		" AND "+visibleLinks+" < ? AND "+visibleLinks+" < ?",
+		a, b, a, b, uid, a, uid, a, uid, maxLinksPerTask, b, uid, b, uid, maxLinksPerTask)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		return nil
+	}
+	// Nothing written: already linked, or a task gone/invisible (both fine,
+	// nothing to do) — or the limit.
+	var exists, visible bool
+	var na, nb int
+	if err := db.QueryRow("SELECT EXISTS (SELECT 1 FROM links WHERE a = ? AND b = ?), "+both+", "+visibleLinks+", "+visibleLinks,
+		a, b, a, b, uid, a, uid, a, uid, b, uid, b, uid).Scan(&exists, &visible, &na, &nb); err != nil {
+		return err
+	}
+	if !exists && visible && (na >= maxLinksPerTask || nb >= maxLinksPerTask) {
+		return errLinkLimit
+	}
+	return nil
+}
+
+// unlinkAcross removes the links between list and the tasks in member's
+// own lists — they leave the list now (left, removed, list deleted), and
+// such a link could afterward be seen and removed by nobody.
+func unlinkAcross(ex execer, list, member int64) error {
+	const inList = "SELECT id FROM tasks WHERE list_id = ?"
+	const theirs = "SELECT id FROM tasks WHERE list_id IN (SELECT id FROM lists WHERE owner_id = ?)"
+	_, err := ex.Exec("DELETE FROM links WHERE (a IN ("+inList+") AND b IN ("+theirs+")) OR (b IN ("+inList+") AND a IN ("+theirs+"))",
+		list, member, list, member)
 	return err
 }
 
@@ -810,19 +936,42 @@ func sessionAuthAt(db *sql.DB, token string) (time.Time, bool) {
 // (or with a deleted one) is not a login — never fall back to a default
 // user.
 func sessionUser(db *sql.DB, token string) (uid int64, expires time.Time, ok bool) {
+	si, ok := sessionLookup(db, token)
+	return si.uid, si.expires, ok
+}
+
+// sessionInfo: a valid session as requireAuth sees it. authAt is zero for
+// sessions without a passkey timestamp (legacy) — they never count as fresh.
+type sessionInfo struct {
+	uid     int64
+	expires time.Time
+	authAt  time.Time
+}
+
+// sessionLookup reads a valid session in one query (user, expiry, and the
+// time of the passkey login for requireFreshAuth).
+func sessionLookup(db *sql.DB, token string) (sessionInfo, bool) {
+	var si sessionInfo
 	if token == "" {
-		return 0, time.Time{}, false
+		return si, false
 	}
 	var exp string
-	if err := db.QueryRow("SELECT expires_at, user_id FROM sessions WHERE token = ? "+
-		"AND user_id IN (SELECT id FROM users)", hashToken(token)).Scan(&exp, &uid); err != nil {
-		return 0, time.Time{}, false
+	var at sql.NullString
+	if err := db.QueryRow("SELECT expires_at, user_id, auth_at FROM sessions WHERE token = ? "+
+		"AND user_id IN (SELECT id FROM users)", hashToken(token)).Scan(&exp, &si.uid, &at); err != nil {
+		return sessionInfo{}, false
 	}
 	t, err := time.Parse(time.RFC3339, exp)
 	if err != nil || !t.After(time.Now().UTC()) {
-		return 0, time.Time{}, false
+		return sessionInfo{}, false
 	}
-	return uid, t, true
+	si.expires = t
+	if at.Valid {
+		if a, err := time.Parse(time.RFC3339, at.String); err == nil {
+			si.authAt = a
+		}
+	}
+	return si, true
 }
 
 func sessionValid(db *sql.DB, token string) bool {
@@ -830,9 +979,11 @@ func sessionValid(db *sql.DB, token string) bool {
 	return ok
 }
 
+// renewSession never revives a retired session: a request that read the
+// session just before retireSession must not push it back out to 30 days.
 func renewSession(db *sql.DB, token string, expires time.Time) error {
-	_, err := db.Exec("UPDATE sessions SET expires_at = ? WHERE token = ?",
-		expires.UTC().Format(time.RFC3339), hashToken(token))
+	_, err := db.Exec("UPDATE sessions SET expires_at = ? WHERE token = ? AND expires_at > ?",
+		expires.UTC().Format(time.RFC3339), hashToken(token), time.Now().Add(sessionRetireGrace).UTC().Format(time.RFC3339))
 	return err
 }
 
@@ -931,6 +1082,19 @@ func getMeta(db *sql.DB, key string) string {
 // execer: *sql.DB or *sql.Tx.
 type execer interface {
 	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// querier: *sql.DB or *sql.Tx, for reads — inside a transaction they must
+// go through it (single connection).
+type querier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// dbtx: reads and writes, *sql.DB or *sql.Tx.
+type dbtx interface {
+	execer
+	querier
 }
 
 func setMeta(db execer, key, value string) error {

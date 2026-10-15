@@ -94,6 +94,35 @@ func (rl *rateLimiter) limit(h http.HandlerFunc) http.HandlerFunc {
 	return rl.middleware(h).ServeHTTP
 }
 
+// userSlots caps how many long-running requests of one kind (uploads,
+// imports, SSE streams) a person may have open at the same time — one
+// account must not be able to tie up memory or goroutines for everyone.
+type userSlots struct {
+	mu  sync.Mutex
+	n   map[int64]int
+	max int
+}
+
+func newUserSlots(max int) *userSlots { return &userSlots{n: map[int64]int{}, max: max} }
+
+func (u *userSlots) acquire(uid int64) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.n[uid] >= u.max {
+		return false
+	}
+	u.n[uid]++
+	return true
+}
+
+func (u *userSlots) release(uid int64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.n[uid]--; u.n[uid] <= 0 {
+		delete(u.n, uid)
+	}
+}
+
 // clientIP: nginx sets X-Real-IP to $remote_addr, overwriting any header
 // sent along with the request. It's trusted only if the connection comes
 // from a private or local address — that's how nginx on the host reaches

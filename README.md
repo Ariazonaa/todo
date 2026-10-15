@@ -49,8 +49,9 @@ reminded — and tries to do them well.
   add puts a task straight into a list
 - **Accounts**: the admin creates accounts in the settings; everyone gets a
   personal setup code and only sees their own lists and tasks
-- **Shared lists**: share a list with other accounts — everyone edits its
-  tasks, only the owner manages the list; reminders go to everyone involved
+- **Shared lists**: invite other accounts to a list — once they accept,
+  everyone edits its tasks, only the owner manages the list; reminders go to
+  everyone involved
 - **Quick add** understands dates, times and repeats in plain language
   ("Buy milk tomorrow 6pm", "Rent in 3 days", "Trash every monday",
   "Rent monthly"; `!1` high … `!3` low priority)
@@ -132,8 +133,11 @@ An nginx example (HTTPS, HTTP/3, HSTS, Host header, upload limits) is in
   without one creates a new code.
 - Passkeys need **user verification** (PIN/biometrics). A security key
   without a PIN won't do — set a PIN first.
-- **Adding/removing passkeys** requires a fresh sign-in (at most 10 minutes
-  old); otherwise the app asks for an existing passkey first.
+- **Adding/removing passkeys**, creating or removing accounts and setup codes,
+  sharing a list, changing the Discord webhook and importing a backup require
+  a fresh sign-in (at most 10 minutes old); otherwise the app asks for one of
+  your passkeys first. A stolen session cookie alone can't turn into lasting
+  access this way.
 
 ### Locked out? (all passkeys lost)
 

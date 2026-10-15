@@ -17,24 +17,39 @@ import (
 // exporting user's reminder timestamps as reminded_at/
 // push_reminded_at), so a restore is truly lossless.
 type exportTask struct {
-	ID             int64   `json:"id"`
-	Title          string  `json:"title"`
-	DueDate        *string `json:"due_date"`
-	DueTime        *string `json:"due_time"`
-	Recurrence     string  `json:"recurrence"`
-	Done           bool    `json:"done"`
-	CreatedAt      string  `json:"created_at"`
-	CompletedAt    *string `json:"completed_at"`
-	RemindedAt     *string `json:"reminded_at"`
-	PushRemindedAt *string `json:"push_reminded_at"`
-	ParentID       *int64  `json:"parent_id"`
-	Note           string  `json:"note"`
-	Pinned         bool    `json:"pinned"`
-	InProgress     bool    `json:"in_progress"`
-	Priority       int     `json:"priority"`
-	ListID         int64   `json:"list_id"`
-	SortOrder      int64   `json:"sort_order"`
+	ID             int64    `json:"id"`
+	Title          string   `json:"title"`
+	DueDate        *string  `json:"due_date"`
+	DueTime        *string  `json:"due_time"`
+	Recurrence     string   `json:"recurrence"`
+	Done           bool     `json:"done"`
+	CreatedAt      string   `json:"created_at"`
+	CompletedAt    *string  `json:"completed_at"`
+	RemindedAt     *string  `json:"reminded_at"`
+	PushRemindedAt optStamp `json:"push_reminded_at"`
+	ParentID       *int64   `json:"parent_id"`
+	Note           string   `json:"note"`
+	Pinned         bool     `json:"pinned"`
+	InProgress     bool     `json:"in_progress"`
+	Priority       int      `json:"priority"`
+	ListID         int64    `json:"list_id"`
+	SortOrder      int64    `json:"sort_order"`
 }
+
+// optStamp is a nullable timestamp that remembers whether the backup had the
+// field at all: backups from before web push lack push_reminded_at, newer
+// ones write null for "never pushed".
+type optStamp struct {
+	set bool
+	v   *string
+}
+
+func (o *optStamp) UnmarshalJSON(b []byte) error {
+	o.set = true
+	return json.Unmarshal(b, &o.v)
+}
+
+func (o optStamp) MarshalJSON() ([]byte, error) { return json.Marshal(o.v) }
 
 type exportList struct {
 	ID        int64   `json:"id"`
@@ -95,7 +110,7 @@ func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var t exportTask
 		var done, pinned, inProgress int
-		if err := rows.Scan(&t.ID, &t.Title, &t.DueDate, &t.DueTime, &t.Recurrence, &done, &t.CreatedAt, &t.CompletedAt, &t.RemindedAt, &t.PushRemindedAt, &t.ParentID, &t.Note, &pinned, &inProgress, &t.SortOrder, &t.Priority, &t.ListID); err != nil {
+		if err := rows.Scan(&t.ID, &t.Title, &t.DueDate, &t.DueTime, &t.Recurrence, &done, &t.CreatedAt, &t.CompletedAt, &t.RemindedAt, &t.PushRemindedAt.v, &t.ParentID, &t.Note, &pinned, &inProgress, &t.SortOrder, &t.Priority, &t.ListID); err != nil {
 			rows.Close()
 			writeError(w, r, http.StatusInternalServerError, "error.internal")
 			return
@@ -257,20 +272,42 @@ const (
 // Must match client_max_body_size in deploy/nginx.
 const maxImportBytes = 2 << 30
 
+// One import per person at a time (they stage their images under their own
+// ID), and at most two overall — each needs ~200 MB at its peak. A slow
+// upload of one person no longer blocks everyone else's.
+var (
+	userImports = newUserSlots(1)
+	importSlots = make(chan struct{}, 2)
+)
+
+// handleImport replaces all of the person's data — with a stolen session
+// cookie alone that would be both a wipe and (via the backup's webhook)
+// a lasting leak, hence a fresh login, checked before the upload.
 func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
-	if !s.importMu.TryLock() {
+	if !s.requireFreshAuth(w, r) {
+		return
+	}
+	uid := userID(r)
+	if !userImports.acquire(uid) {
 		writeError(w, r, http.StatusConflict, "error.import_running")
 		return
 	}
-	defer s.importMu.Unlock()
+	defer userImports.release(uid)
+	select {
+	case importSlots <- struct{}{}:
+		defer func() { <-importSlots }()
+	default:
+		writeError(w, r, http.StatusServiceUnavailable, "error.import_busy")
+		return
+	}
 	extendReadDeadline(w, time.Hour) // up to 2 GB, even over a slow connection
-	if _, err := s.db.Exec("DELETE FROM import_attachments"); err != nil {
+	if _, err := s.db.Exec("DELETE FROM import_attachments WHERE user_id = ?", uid); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
-	defer s.db.Exec("DELETE FROM import_attachments")
+	defer s.db.Exec("DELETE FROM import_attachments WHERE user_id = ?", uid)
 	r.Body = http.MaxBytesReader(w, r.Body, maxImportBytes)
-	data, err := s.readImport(r.Body)
+	data, err := s.readImport(r.Body, uid)
 	if err != nil {
 		if _, tooBig := errors.AsType[*http.MaxBytesError](err); tooBig {
 			writeError(w, r, http.StatusRequestEntityTooLarge, "error.backup_too_big")
@@ -298,9 +335,12 @@ func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 	ids := map[int64]bool{}
 	byID := map[int64]exportTask{}
+	importedAt := time.Now().UTC().Format(time.RFC3339)
 	for i := range data.Tasks {
 		t := &data.Tasks[i]
-		if t.ID <= 0 || t.ID > maxImportID || strings.TrimSpace(t.Title) == "" {
+		t.Title = strings.TrimSpace(cleanTitle(t.Title))
+		t.Note = cleanNote(t.Note)
+		if t.ID <= 0 || t.ID > maxImportID || t.Title == "" {
 			writeError(w, r, http.StatusBadRequest, "error.backup.no_id")
 			return
 		}
@@ -360,6 +400,20 @@ func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
 			t.Pinned = false
 			t.InProgress = false
 		}
+		// Timestamps are compared as RFC 3339 strings (auto-archive, "done"
+		// order): a broken one would archive a task at once ("0") or never
+		// ("z"). Repaired rather than rejected — they're not worth losing a backup over.
+		t.CreatedAt = normStamp(t.CreatedAt, importedAt)
+		if t.CompletedAt != nil {
+			c := normStamp(*t.CompletedAt, importedAt)
+			t.CompletedAt = &c
+		}
+		if t.Done && t.CompletedAt == nil {
+			t.CompletedAt = &importedAt
+		}
+		if !t.Done {
+			t.CompletedAt = nil
+		}
 		switch {
 		case len(data.Lists) == 0 || t.ListID == 0:
 			t.ListID = defaultList
@@ -398,7 +452,6 @@ func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 	// Replaces only the own data and assigns new IDs: IDs are instance-wide,
 	// the ones from the backup would collide with other users'.
-	uid := userID(r)
 	restore := func() error {
 		own := "SELECT id FROM tasks WHERE list_id " + ownedLists
 		for _, q := range []struct {
@@ -453,17 +506,20 @@ func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
 		insert := func(t exportTask) error {
 			// Backups from before web push don't know this field: fall back to
 			// the Discord state, otherwise push would re-report everything old.
-			pushed := t.PushRemindedAt
-			if pushed == nil {
+			pushed := t.PushRemindedAt.v
+			if !t.PushRemindedAt.set {
 				pushed = t.RemindedAt
 			}
-			var parent any
+			var parent, completedBy any
 			if t.ParentID != nil {
 				parent = taskMap[*t.ParentID]
 			}
+			if t.Done {
+				completedBy = uid // their stats come along in the same backup
+			}
 			res, err := tx.Exec(
-				"INSERT INTO tasks (title, due_date, due_time, recurrence, done, created_at, completed_at, parent_id, note, pinned, in_progress, sort_order, priority, list_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				t.Title, t.DueDate, t.DueTime, t.Recurrence, boolInt(t.Done), t.CreatedAt, t.CompletedAt, parent, t.Note, boolInt(t.Pinned), boolInt(t.InProgress), t.SortOrder, t.Priority, listMap[t.ListID])
+				"INSERT INTO tasks (title, due_date, due_time, recurrence, done, created_at, completed_at, parent_id, note, pinned, in_progress, sort_order, priority, list_id, completed_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				t.Title, t.DueDate, t.DueTime, t.Recurrence, boolInt(t.Done), t.CreatedAt, t.CompletedAt, parent, t.Note, boolInt(t.Pinned), boolInt(t.InProgress), t.SortOrder, t.Priority, listMap[t.ListID], completedBy)
 			if err != nil {
 				return err
 			}
@@ -502,7 +558,7 @@ func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
 		}
 		// As in the API: an open subtask has an open parent task
 		// (reopenParentOf) — otherwise it would sit invisibly in the collapsed "Done" section.
-		if _, err := tx.Exec("UPDATE tasks SET done = 0, completed_at = NULL WHERE done = 1 AND list_id "+ownedLists+" AND id IN "+
+		if _, err := tx.Exec("UPDATE tasks SET done = 0, completed_at = NULL, completed_by = NULL WHERE done = 1 AND list_id "+ownedLists+" AND id IN "+
 			"(SELECT parent_id FROM tasks WHERE done = 0 AND parent_id IS NOT NULL)", uid); err != nil {
 			return err
 		}
@@ -537,9 +593,9 @@ func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
 			WHERE i.seq IN (
 				SELECT seq FROM (
 					SELECT seq, ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY seq) AS n
-					FROM import_attachments WHERE task_id IN (SELECT old FROM import_task_map)
+					FROM import_attachments WHERE user_id = ? AND task_id IN (SELECT old FROM import_task_map)
 				) WHERE n <= ?
-			) ORDER BY i.seq`, maxAttachmentsPerTask)
+			) ORDER BY i.seq`, uid, maxAttachmentsPerTask)
 		return err
 	}
 	if err := restore(); err != nil {
@@ -574,6 +630,42 @@ func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// normStamp returns s in the stored form (RFC 3339, UTC, whole seconds), or
+// fallback if it isn't a timestamp: "+02:00" or fractions would compare wrong
+// as strings.
+func normStamp(s, fallback string) string {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return fallback
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// elemLimit caps how much of the body a single JSON element may take:
+// json.Decoder buffers an element whole before decoding it, so one huge
+// image or note would otherwise take memory up to the body limit (and two
+// imports at once twice that). reset is called before every element.
+type elemLimit struct {
+	r      io.Reader
+	n, max int64
+}
+
+var errElementTooLarge = errors.New("backup element too large")
+
+func (l *elemLimit) Read(p []byte) (int, error) {
+	if l.n > l.max {
+		return 0, errElementTooLarge
+	}
+	k, err := l.r.Read(p)
+	l.n += int64(k)
+	return k, err
+}
+
+func (l *elemLimit) reset() { l.n = 0 }
+
+// maxImportElement: the largest image as base64 plus room for its other fields.
+const maxImportElement = maxAttachmentSize/3*4 + 1<<20
+
 // stageError: a DB error while staging, not a broken backup.
 type stageError struct{ err error }
 
@@ -584,9 +676,10 @@ func (e stageError) Unwrap() error { return e.err }
 // except the images is small and gets decoded normally, the images go
 // into the staging area one at a time. Field names are matched case-insensitively,
 // as encoding/json does; unknown fields are skipped.
-func (s *server) readImport(body io.Reader) (exportData, error) {
+func (s *server) readImport(body io.Reader, uid int64) (exportData, error) {
 	var data exportData
-	dec := json.NewDecoder(body)
+	lim := &elemLimit{r: body, max: maxImportElement}
+	dec := json.NewDecoder(lim)
 	if tok, err := dec.Token(); err != nil {
 		return data, err
 	} else if d, ok := tok.(json.Delim); !ok || d != '{' {
@@ -598,19 +691,20 @@ func (s *server) readImport(body io.Reader) (exportData, error) {
 			return data, err
 		}
 		key, _ := tok.(string)
+		lim.reset()
 		switch strings.ToLower(key) {
 		case "attachments":
-			err = s.stageAttachments(dec)
+			err = s.stageAttachments(dec, lim, uid)
 		case "exported_at":
 			err = dec.Decode(&data.ExportedAt)
 		case "lists":
-			data.Lists, err = decodeList[exportList](dec, maxLists, "lists")
+			data.Lists, err = decodeList[exportList](dec, lim, maxLists, "lists")
 		case "tasks":
-			data.Tasks, err = decodeList[exportTask](dec, maxImportTasks, "tasks")
+			data.Tasks, err = decodeList[exportTask](dec, lim, maxImportTasks, "tasks")
 		case "links":
-			data.Links, err = decodeList[[2]int64](dec, maxImportLinks, "links")
+			data.Links, err = decodeList[[2]int64](dec, lim, maxImportLinks, "links")
 		case "stats":
-			data.Stats, err = decodeStats(dec)
+			data.Stats, err = decodeStats(dec, lim)
 		case "settings":
 			err = dec.Decode(&data.Settings)
 		default:
@@ -625,7 +719,7 @@ func (s *server) readImport(body io.Reader) (exportData, error) {
 	return data, err
 }
 
-func (s *server) stageAttachments(dec *json.Decoder) error {
+func (s *server) stageAttachments(dec *json.Decoder, lim *elemLimit, uid int64) error {
 	tok, err := dec.Token()
 	if err != nil {
 		return err
@@ -638,6 +732,7 @@ func (s *server) stageAttachments(dec *json.Decoder) error {
 	}
 	for dec.More() {
 		var a exportAttachment
+		lim.reset()
 		if err := dec.Decode(&a); err != nil {
 			return err
 		}
@@ -648,8 +743,8 @@ func (s *server) stageAttachments(dec *json.Decoder) error {
 		if len(a.Data) == 0 || len(a.Data) > maxAttachmentSize || !allowedImageMimes[a.Mime] {
 			continue
 		}
-		if _, err := s.db.Exec("INSERT INTO import_attachments (task_id, mime, created_at, data) VALUES (?, ?, ?, ?)",
-			a.TaskID, a.Mime, a.CreatedAt, a.Data); err != nil {
+		if _, err := s.db.Exec("INSERT INTO import_attachments (user_id, task_id, mime, created_at, data) VALUES (?, ?, ?, ?, ?)",
+			uid, a.TaskID, a.Mime, normStamp(a.CreatedAt, time.Now().UTC().Format(time.RFC3339)), a.Data); err != nil {
 			return stageError{err}
 		}
 	}
@@ -658,10 +753,9 @@ func (s *server) stageAttachments(dec *json.Decoder) error {
 }
 
 // Upper bounds for the number of entries, checked element by element: a
-// huge list aborts this way before it's fully loaded into memory. The length
-// of individual fields (title, note) is only checked by the import after decoding —
-// so a single huge field can use memory up to the body limit. Only the
-// logged-in user themselves can trigger that. Real data sets are orders of
+// huge list aborts this way before it's fully loaded into memory. A single
+// element is capped by elemLimit; the length of individual fields (title,
+// note) is checked by the import after decoding. Real data sets are orders of
 // magnitude below these limits.
 const (
 	maxImportTasks = 100_000
@@ -674,7 +768,7 @@ type tooManyError struct{ what string } // what: field in the backup ("tasks", "
 func (e tooManyError) Error() string { return "too many " + e.what }
 
 // decodeList reads a JSON list element by element (null = empty).
-func decodeList[T any](dec *json.Decoder, max int, what string) ([]T, error) {
+func decodeList[T any](dec *json.Decoder, lim *elemLimit, max int, what string) ([]T, error) {
 	tok, err := dec.Token()
 	if err != nil || tok == nil {
 		return nil, err
@@ -688,6 +782,7 @@ func decodeList[T any](dec *json.Decoder, max int, what string) ([]T, error) {
 			return nil, tooManyError{what}
 		}
 		var v T
+		lim.reset()
 		if err := dec.Decode(&v); err != nil {
 			return nil, err
 		}
@@ -698,7 +793,7 @@ func decodeList[T any](dec *json.Decoder, max int, what string) ([]T, error) {
 }
 
 // decodeStats reads the stats object {"YYYY-MM-DD": n} entry by entry.
-func decodeStats(dec *json.Decoder) (map[string]int, error) {
+func decodeStats(dec *json.Decoder, lim *elemLimit) (map[string]int, error) {
 	tok, err := dec.Token()
 	if err != nil || tok == nil {
 		return nil, err
@@ -711,6 +806,7 @@ func decodeStats(dec *json.Decoder) (map[string]int, error) {
 		if len(out) >= maxImportStats {
 			return nil, tooManyError{"stats"}
 		}
+		lim.reset()
 		k, err := dec.Token()
 		if err != nil {
 			return nil, err

@@ -37,23 +37,36 @@ func scanPushSub(row interface{ Scan(...any) error }) (pushSub, error) {
 	return sub, err
 }
 
-// savePushSub creates a device or updates it (reload, self-healing, new
-// passkey) — one endpoint, one row.
-// savePushSub registers a device for uid. If the same device (endpoint)
-// registers under a different person — a shared tablet — it belongs to
-// that person afterward.
+// errPushTaken: the endpoint belongs to another account, and the request
+// doesn't carry that device's keys.
+var errPushTaken = errors.New("push: endpoint registered to another account")
+
+// savePushSub registers a device for uid or updates it (reload,
+// self-healing, new passkey) — one endpoint, one row. If the same device
+// registers under a different person — a shared tablet — it belongs to that
+// person afterward. But only with the same keys: the browser keeps them for
+// its subscription, whereas someone who merely learned the endpoint doesn't
+// know the auth secret — and could otherwise unhook another person's device.
 func savePushSub(db *sql.DB, endpoint string, p256dh, auth []byte, origin string, credentialID, uid int64) error {
 	var cred any
 	if credentialID > 0 {
 		cred = credentialID
 	}
-	_, err := db.Exec(`INSERT INTO push_subscriptions (endpoint, p256dh, auth, origin, credential_id, created_at, user_id)
+	res, err := db.Exec(`INSERT INTO push_subscriptions (endpoint, p256dh, auth, origin, credential_id, created_at, user_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth,
-			origin = excluded.origin, credential_id = excluded.credential_id, user_id = excluded.user_id`,
+			origin = excluded.origin, credential_id = excluded.credential_id, user_id = excluded.user_id
+		WHERE push_subscriptions.user_id IS excluded.user_id
+			OR (push_subscriptions.p256dh = excluded.p256dh AND push_subscriptions.auth = excluded.auth)`,
 		endpoint, b64.EncodeToString(p256dh), b64.EncodeToString(auth), origin, cred,
 		time.Now().UTC().Format(time.RFC3339), uid)
-	return err
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return errPushTaken
+	}
+	return nil
 }
 
 // getPushSub: the device endpoint belonging to uid.
@@ -178,11 +191,14 @@ func (s *server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	// Origin: contact for the VAPID JWT (Apple requires an https sub).
 	origin := r.Header.Get("Origin")
-	if origin == "" {
+	if u, err := url.Parse(origin); err != nil || u.Scheme != "https" || u.Host == "" {
 		origin = "https://" + r.Host
 	}
 	cred := sessionCredential(s.db, s.sessionToken(r))
-	if err := savePushSub(s.db, req.Endpoint, p256dh, auth, origin, cred, userID(r)); err != nil {
+	if err := savePushSub(s.db, req.Endpoint, p256dh, auth, origin, cred, userID(r)); errors.Is(err, errPushTaken) {
+		writeError(w, r, http.StatusConflict, "error.push_taken")
+		return
+	} else if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}

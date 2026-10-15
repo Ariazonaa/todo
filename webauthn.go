@@ -69,6 +69,12 @@ func loadCreds(db *sql.DB, uid int64, u *wanUser) (*wanData, error) {
 	for _, sc := range stored {
 		var c webauthn.Credential
 		if err := json.Unmarshal([]byte(sc.Data), &c); err != nil {
+			if uid == 0 {
+				// The login loads everyone's passkeys: one broken row must
+				// not lock out all accounts.
+				log.Printf("credential %d: %v", sc.ID, err)
+				continue
+			}
 			return nil, fmt.Errorf("credential %d: %w", sc.ID, err)
 		}
 		d.user.creds = append(d.user.creds, c)
@@ -106,6 +112,10 @@ type ceremonies struct {
 	mu   sync.Mutex
 	used map[string]time.Time // redeemed -> expiry; single use
 	fifo []string             // redemption order = expiry order (fixed TTL)
+	// evictedUpTo: the latest expiry ever pushed out of a full list while
+	// still valid. Every ceremony expiring no later than that could already
+	// have been redeemed without the list knowing anymore — it's refused.
+	evictedUpTo time.Time
 }
 
 type ceremonyToken struct {
@@ -113,6 +123,9 @@ type ceremonyToken struct {
 	Nonce   string                `json:"n"` // unique per ceremony, key into used
 	Expires int64                 `json:"e"`
 	SD      *webauthn.SessionData `json:"s"`
+	// Bind: hash of the session the ceremony was started from (re-auth,
+	// adding a passkey) — finishing it needs the same session.
+	Bind string `json:"b,omitempty"`
 }
 
 func newCeremonies() *ceremonies {
@@ -129,12 +142,12 @@ func newCeremonies() *ceremonies {
 	return &ceremonies{aead: aead, now: time.Now, used: map[string]time.Time{}}
 }
 
-func (c *ceremonies) seal(kind string, sd *webauthn.SessionData) (string, error) {
+func (c *ceremonies) seal(kind, bind string, sd *webauthn.SessionData) (string, error) {
 	id, err := randomToken()
 	if err != nil {
 		return "", err
 	}
-	plain, err := json.Marshal(ceremonyToken{Kind: kind, Nonce: id, Expires: c.now().Add(ceremonyTTL).Unix(), SD: sd})
+	plain, err := json.Marshal(ceremonyToken{Kind: kind, Nonce: id, Expires: c.now().Add(ceremonyTTL).Unix(), SD: sd, Bind: bind})
 	if err != nil {
 		return "", err
 	}
@@ -156,7 +169,7 @@ type ceremonyTicket struct {
 // already been redeemed. It's only redeemed via consume — after the passkey check.
 // open used to mark it immediately; then begin + junk finish calls filled the list
 // and evicted real logins, which could then be replayed.
-func (c *ceremonies) open(kind, value string) *ceremonyTicket {
+func (c *ceremonies) open(kind, bind, value string) *ceremonyTicket {
 	raw, err := base64.RawURLEncoding.DecodeString(value)
 	ns := c.aead.NonceSize()
 	if err != nil || len(raw) < ns {
@@ -167,7 +180,7 @@ func (c *ceremonies) open(kind, value string) *ceremonyTicket {
 		return nil
 	}
 	var tok ceremonyToken
-	if err := json.Unmarshal(plain, &tok); err != nil || tok.Kind != kind || tok.SD == nil {
+	if err := json.Unmarshal(plain, &tok); err != nil || tok.Kind != kind || tok.SD == nil || tok.Bind != bind {
 		return nil
 	}
 	exp := time.Unix(tok.Expires, 0)
@@ -176,8 +189,9 @@ func (c *ceremonies) open(kind, value string) *ceremonyTicket {
 	}
 	c.mu.Lock()
 	_, seen := c.used[tok.Nonce]
+	evicted := !exp.After(c.evictedUpTo)
 	c.mu.Unlock()
-	if seen {
+	if seen || evicted {
 		return nil
 	}
 	return &ceremonyTicket{sd: tok.SD, nonce: tok.Nonce, exp: exp}
@@ -190,10 +204,13 @@ func (c *ceremonies) consume(t *ceremonyTicket) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for len(c.fifo) > 0 && (len(c.fifo) >= maxUsedCeremonies || !now.Before(c.used[c.fifo[0]])) {
+		if exp := c.used[c.fifo[0]]; now.Before(exp) && exp.After(c.evictedUpTo) {
+			c.evictedUpTo = exp // pushed out while still valid
+		}
 		delete(c.used, c.fifo[0])
 		c.fifo = c.fifo[1:]
 	}
-	if _, seen := c.used[t.nonce]; seen {
+	if _, seen := c.used[t.nonce]; seen || !t.exp.After(c.evictedUpTo) {
 		return false
 	}
 	c.used[t.nonce] = t.exp
@@ -203,7 +220,7 @@ func (c *ceremonies) consume(t *ceremonyTicket) bool {
 
 // startCeremony hands the ceremony to the browser as a cookie.
 func (s *server) startCeremony(w http.ResponseWriter, r *http.Request, kind string, sd *webauthn.SessionData) error {
-	value, err := s.cer.seal(kind, sd)
+	value, err := s.cer.seal(kind, s.ceremonyBind(r, kind), sd)
 	if err != nil {
 		return err
 	}
@@ -219,7 +236,16 @@ func (s *server) takeCeremony(w http.ResponseWriter, r *http.Request, kind strin
 	if value == "" {
 		return nil
 	}
-	return s.cer.open(kind, value)
+	return s.cer.open(kind, s.ceremonyBind(r, kind), value)
+}
+
+// ceremonyBind: ceremonies of a logged-in session (re-auth, adding a
+// passkey) belong to that session; login and setup happen without one.
+func (s *server) ceremonyBind(r *http.Request, kind string) string {
+	if kind != "reauth" && kind != "register" {
+		return ""
+	}
+	return hashToken(s.sessionToken(r))
 }
 
 // wan builds the WebAuthn instance from the request: RP ID = host (without port),
@@ -262,11 +288,14 @@ func uvRequiredFor(creds []webauthn.Credential, id []byte) bool {
 }
 
 // requireFreshAuth only lets through sessions that authenticated via passkey
-// less than reauthWindow ago. Otherwise 403 with "reauth": the
-// client logs in again via passkey (which yields a fresh session)
-// and retries the request.
+// less than reauthWindow ago. Otherwise 403 with "reauth": the client
+// confirms via passkey (handleReauthFinish, which issues a fresh session)
+// and retries the request. The time comes from requireAuth, read along
+// with the session — without it, the request doesn't count as fresh.
 func (s *server) requireFreshAuth(w http.ResponseWriter, r *http.Request) bool {
-	if at, ok := sessionAuthAt(s.db, s.sessionToken(r)); ok && time.Since(at) < reauthWindow {
+	at, ok := r.Context().Value(authAtKey).(time.Time)
+	// A time in the future (clock set back) isn't a fresh login either.
+	if age := time.Since(at); ok && age < reauthWindow && age > -time.Minute {
 		return true
 	}
 	writeJSON(w, http.StatusForbidden, map[string]any{
@@ -294,7 +323,7 @@ func (s *server) noPasskeys() (bool, error) {
 }
 
 func credName(r *http.Request) string {
-	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	name := strings.TrimSpace(cleanName(r.URL.Query().Get("name")))
 	if name == "" {
 		name = "Passkey"
 	}
@@ -410,10 +439,35 @@ func (s *server) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "error.no_login")
 		return
 	}
+	if err := s.replaceSession(w, r, s.saveAssertion(wd, cred), uid); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// replaceSession starts a session after a passkey ceremony. One the browser
+// already had (login or setup from within a session, re-auth) expires
+// shortly, instead of staying valid for weeks as a zombie — or, after a
+// re-auth, of a stolen copy turning fresh along with it. Not deleted
+// immediately: requests still in flight with the old cookie would otherwise
+// get bounced to login via 401.
+func (s *server) replaceSession(w http.ResponseWriter, r *http.Request, credRow, uid int64) error {
+	if err := s.startSession(w, credRow, uid); err != nil {
+		return err
+	}
+	if old := s.sessionToken(r); old != "" {
+		retireSession(s.db, old, sessionRetireGrace)
+	}
+	return nil
+}
+
+// saveAssertion persists what a passkey assertion changed (SignCount,
+// flags) and returns the passkey's DB row.
+func (s *server) saveAssertion(wd *wanData, cred *webauthn.Credential) int64 {
 	if cred.Authenticator.CloneWarning {
 		log.Printf("webauthn: CloneWarning for credential %x", cred.ID)
 	}
-	// Persist SignCount
 	credRow := wd.rowByID[string(cred.ID)]
 	if credRow > 0 {
 		if data, err := json.Marshal(cred); err == nil {
@@ -422,16 +476,98 @@ func (s *server) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if err := s.startSession(w, credRow, uid); err != nil {
+	return credRow
+}
+
+// --- Re-authentication (logged in: confirmation before managing passkeys, accounts, sharing, webhook) ---
+
+// handleFreshCheck answers whether the session is freshly confirmed — the
+// client asks before a large upload (import) instead of having it rejected
+// unread.
+func (s *server) handleFreshCheck(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFreshAuth(w, r) {
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleReauthBegin is a login with only the logged-in account's passkeys.
+// A full login accepts any passkey on the device — on a shared tablet,
+// picking someone else's silently switched accounts, and the passkey about
+// to be added then landed in that other account.
+func (s *server) handleReauthBegin(w http.ResponseWriter, r *http.Request) {
+	wd, err := loadWanUser(s.db, userID(r))
+	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
-	// A login from within an active session (confirmation before
-	// managing passkeys): the replaced session expires shortly, instead of staying
-	// valid for weeks as a zombie. Not deleted immediately — requests still
-	// in flight with the old cookie would otherwise get bounced to login via 401.
-	if old := s.sessionToken(r); old != "" {
-		retireSession(s.db, old, sessionRetireGrace)
+	wan, err := s.wan(r)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
+	options, sd, err := wan.BeginLogin(wd.user, webauthn.WithUserVerification(protocol.VerificationPreferred))
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
+	cookieSD := *sd
+	cookieSD.AllowedCredentialIDs = nil // finish rereads them from the DB (4 KB cookie limit)
+	if err := s.startCeremony(w, r, "reauth", &cookieSD); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
+	writeJSON(w, http.StatusOK, options)
+}
+
+// handleReauthFinish confirms with a passkey of the same account only
+// (ValidateLogin compares the account against the handle begin put into the
+// ceremony) and then replaces the session, like a login: freshness hangs on
+// the token, so refreshing the old one would also have made every stolen
+// copy of that cookie fresh — enough to swap the passkeys.
+func (s *server) handleReauthFinish(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 65536)
+	ticket := s.takeCeremony(w, r, "reauth")
+	if ticket == nil {
+		writeError(w, r, http.StatusBadRequest, "error.no_login")
+		return
+	}
+	parsed, err := protocol.ParseCredentialRequestResponseBody(r.Body)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "error.bad_authenticator")
+		return
+	}
+	wd, err := loadWanUser(s.db, userID(r))
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
+	wan, err := s.wan(r)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
+	sd := ticket.sd
+	sd.AllowedCredentialIDs = nil
+	for _, c := range wd.user.creds {
+		sd.AllowedCredentialIDs = append(sd.AllowedCredentialIDs, c.ID)
+	}
+	cred, err := wan.ValidateLogin(wd.user, *sd, parsed)
+	if err != nil {
+		writeError(w, r, http.StatusUnauthorized, "error.login_failed")
+		return
+	}
+	if uvRequiredFor(wd.user.creds, cred.ID) && !cred.Flags.UserVerified {
+		writeError(w, r, http.StatusUnauthorized, "error.login_uv")
+		return
+	}
+	if !s.cer.consume(ticket) {
+		writeError(w, r, http.StatusBadRequest, "error.no_login")
+		return
+	}
+	if err := s.replaceSession(w, r, s.saveAssertion(wd, cred), userID(r)); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -549,7 +685,7 @@ func (s *server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 	if err := s.prepareSetupCode(); err != nil {
 		log.Printf("setup: remove setup code: %v", err)
 	}
-	if err := s.startSession(w, credRow, uid); err != nil {
+	if err := s.replaceSession(w, r, credRow, uid); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
@@ -603,7 +739,7 @@ func (s *server) finishSetupWithCode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
-	if err := s.startSession(w, credRow, uid); err != nil {
+	if err := s.replaceSession(w, r, credRow, uid); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}

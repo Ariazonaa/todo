@@ -28,7 +28,11 @@ i18nReady.then(async () => {
   try {
     const res = await fetch('/api/setup/mode');
     if (res.ok && !(await res.json()).first) {
-      document.querySelector('.hint').textContent = t('setup.hint_code');
+      // Via data-i18n: a catalog arriving late re-translates the page and
+      // would otherwise bring back the first-time-setup text.
+      const hint = document.querySelector('.hint');
+      hint.dataset.i18n = 'setup.hint_code';
+      translateInto(hint, 'setup.hint_code');
     }
   } catch {}
 });

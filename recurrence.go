@@ -1,11 +1,28 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
 
 const dateFmt = "2006-01-02"
+
+// Due dates stay within four-digit years: "10000-01-01" would sort before
+// "2026-…" (overdue forever), and SQLite's date() can't shift it. With the
+// upper end at 9000, no recurrence or snooze gets there in practice.
+const (
+	minDueDate = "1000-01-01"
+	maxDueDate = "9000-12-31"
+)
+
+var errDateRange = errors.New("date out of range")
+
+// dueDateOK: a valid YYYY-MM-DD within the allowed years.
+func dueDateOK(s string) bool {
+	_, err := time.Parse(dateFmt, s)
+	return err == nil && s >= minDueDate && s <= maxDueDate
+}
 
 // daysBetween: the distance between two date strings in calendar days
 // (b - a). Both come from the DB or from nextOccurrence and are valid; UTC,

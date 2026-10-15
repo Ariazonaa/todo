@@ -29,6 +29,7 @@ let editPinned = false;
 let dragActive = false;     // is a drag in progress right now? (a re-render would rip the row out from under it)
 let LISTS = [];             // from /api/tasks, default list first
 let currentList = storedList(); // 'all' or a list ID; remembered per device
+let prevOpenTotal = null;       // open tasks in view at the last load (confetti)
 let lockedScrollY = null;   // scroll position while a sheet is open (see syncScrollLock)
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -115,6 +116,7 @@ function storedList() {
 }
 function setCurrentList(v) {
   currentList = v;
+  prevOpenTotal = null; // a different view: its count isn't "the last one checked off"
   try { localStorage.setItem('list', String(v)); } catch {}
   renderChips();
   rerender();
@@ -246,7 +248,6 @@ function playPop() {
 }
 
 // Confetti when the last open task gets checked off (max once per day)
-let prevOpenTotal = null;
 function confetti() {
   if (!motionOK) return;
   const c = document.createElement('canvas');
@@ -722,13 +723,12 @@ async function snooze(task, days) {
   if (editId === task.id) {
     // What the snooze already saved is not a pending change: only update
     // these fields in the snapshot, leave the rest.
-    const snap = JSON.parse(editSnapshot);
     $('#edit-date').value = updated.due_date || '';
     setProgress(updated.in_progress);
     syncPickers();
-    snap[2] = $('#edit-date').value;
-    snap[7] = editProgress;
-    editSnapshot = JSON.stringify(snap);
+    const now = editBody();
+    editSnapshot.due_date = now.due_date;
+    editSnapshot.in_progress = now.in_progress;
   }
   loadTasks();
 }
@@ -840,8 +840,23 @@ function render() {
 }
 
 let lastRendered = ''; // the response that was actually rendered last
+let INVITES = [];      // lists others want to share with this account (not accepted yet)
+let latestLoad = null;
 
+// loadTasks resolves once the newest load has finished — not just its own:
+// a load that a newer one overtook (seq) changes nothing, so whoever awaits
+// it (e.g. the list dialog after sharing) would otherwise read stale LISTS.
 async function loadTasks() {
+  const p = fetchTasks();
+  latestLoad = p;
+  let cur;
+  do {
+    cur = latestLoad;
+    await cur;
+  } while (cur !== latestLoad);
+}
+
+async function fetchTasks() {
   const seq = ++loadSeq;
   try {
     const res = await api('/api/tasks');
@@ -861,12 +876,15 @@ async function loadTasks() {
     TOMORROW = addDays(TODAY, 1);
     TASKS = data.tasks;
     LISTS = data.lists;
+    INVITES = data.invites || [];
     // The selected list no longer exists (another device deleted it)
     if (currentList !== 'all' && !listById(currentList)) {
       currentList = 'all';
+      prevOpenTotal = null;
       try { localStorage.setItem('list', 'all'); } catch {}
     }
     renderChips();
+    renderInvites();
     if (!dragActive) lastRendered = raw; // rerender doesn't redraw during a drag
     rerender();
     maybeConfetti(TASKS.filter((x) => !x.done && inView(x)).length);
@@ -932,9 +950,12 @@ function fillEditForm(t) {
   syncPickers();
 }
 
-// taskOption: entry for a task picker, long titles truncated.
-function taskOption(c) {
-  const o = el('option', '', c.title.length > 40 ? c.title.slice(0, 40) + '…' : c.title);
+// taskOption: entry for a task picker, long titles truncated. withList names
+// the task's list — as a parent task, it would move this one there.
+function taskOption(c, withList = false) {
+  const title = c.title.length > 40 ? c.title.slice(0, 40) + '…' : c.title;
+  const l = withList ? listById(c.list_id) : null;
+  const o = el('option', '', l ? t('edit.parent_in_list', { title, list: listLabelFull(l) }) : title);
   o.value = String(c.id);
   return o;
 }
@@ -961,7 +982,7 @@ function fillParentSelect(task) {
     // if it were missing, the selection would fall back to "none", and saving
     // would silently detach the subtask from its (completed) checklist.
     if (c.id === task.id || c.parent_id || (c.done && c.id !== task.parent_id)) continue;
-    sel.append(taskOption(c));
+    sel.append(taskOption(c, c.list_id !== task.list_id));
   }
   sel.value = task.parent_id ? String(task.parent_id) : '';
   sel.disabled = iHaveSubs;
@@ -1089,8 +1110,14 @@ function refreshEditLists() {
     check.append(icon('check'));
     check.setAttribute('aria-label', withPrio(s.done ? t('task.reopen', { title: s.title }) : t('task.complete', { title: s.title }), s));
     check.addEventListener('click', async () => {
-      const res = await api(`/api/tasks/${s.id}/${s.done ? 'uncomplete' : 'complete'}`, { method: 'POST' }).catch(() => null);
-      if (res) await failed(res);
+      if (inflight.has(s.id)) return; // double tap
+      inflight.add(s.id);
+      try {
+        const res = await api(`/api/tasks/${s.id}/${s.done ? 'uncomplete' : 'complete'}`, { method: 'POST' }).catch(() => null);
+        if (res) await failed(res);
+      } finally {
+        inflight.delete(s.id);
+      }
       loadTasks();
     });
     const title = el('div', 'title', s.title);
@@ -1135,23 +1162,80 @@ function refreshEditLists() {
     sel.append(taskOption(c));
   }
   if ([...sel.options].some((o) => o.value === chosen)) sel.value = chosen;
+  syncUntouchedFields(task);
 }
 
-// editState: what "Save" would currently send. editSnapshot holds the state
-// right after opening — the form is compared against the form, not against
-// the raw data (textareas normalize line endings, subtasks reset pin/
+// editBody: what the form says, as API fields. editSnapshot holds it right
+// after opening — the form is compared against the form, not against the
+// raw data (textareas normalize line endings, subtasks reset pin/
 // recurrence; either would otherwise register as a false "change").
-let editSnapshot = '';
-function editState() {
-  return JSON.stringify([
-    $('#edit-title').value.trim(), $('#edit-note').value.trim(),
-    $('#edit-date').value, $('#edit-time').value, $('#edit-parent').value,
-    editRec, editPinned, editProgress, editPrio, $('#edit-list').value,
-  ]);
+function editBody() {
+  const parentVal = $('#edit-parent').value;
+  return {
+    title: $('#edit-title').value.trim(),
+    note: $('#edit-note').value.trim(),
+    due_date: $('#edit-date').value,
+    due_time: $('#edit-time').value,
+    recurrence: parentVal ? '' : editRec,
+    pinned: parentVal ? false : editPinned,
+    in_progress: parentVal ? false : editProgress,
+    priority: editPrio,
+    // Subtasks follow their parent task — so no list in that case.
+    list_id: parentVal ? null : Number($('#edit-list').value),
+    parent_id: parentVal ? Number(parentVal) : null,
+  };
+}
+let editSnapshot = {};
+
+// editChanges: only what this sheet changed — the server keeps everything
+// else as it is, including what another device changed in the meantime.
+function editChanges() {
+  const out = {};
+  for (const [k, v] of Object.entries(editBody())) {
+    if (k === 'list_id' && v === null) continue;
+    if (JSON.stringify(v) !== JSON.stringify(editSnapshot[k])) out[k] = v;
+  }
+  return out;
 }
 
 function editDirty() {
-  return editId !== null && editState() !== editSnapshot;
+  return editId !== null && Object.keys(editChanges()).length > 0;
+}
+
+// syncUntouchedFields takes over what changed elsewhere (another device, a
+// shared list) into fields the sheet hasn't touched — input is never
+// overwritten.
+const editSetters = {
+  title: (v) => { $('#edit-title').value = v; },
+  note: (v) => { $('#edit-note').value = v; },
+  due_date: (v) => { $('#edit-date').value = v; },
+  due_time: (v) => { $('#edit-time').value = v; },
+  recurrence: (v) => setSegmented(v),
+  pinned: (v) => setPin(v),
+  in_progress: (v) => setProgress(v),
+  priority: (v) => setPrio(v),
+};
+function syncUntouchedFields(task) {
+  const server = {
+    title: task.title.trim(),
+    note: (task.note || '').replace(/\r\n?/g, '\n').trim(),
+    due_date: task.due_date || '',
+    due_time: task.due_time || '',
+    recurrence: task.recurrence || '',
+    pinned: !!task.pinned,
+    in_progress: !!task.in_progress,
+    priority: task.priority || 0,
+  };
+  const now = editBody();
+  let changed = false;
+  for (const k of Object.keys(editSetters)) {
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    if (!same(now[k], editSnapshot[k]) || same(server[k], editSnapshot[k])) continue;
+    editSetters[k](server[k]);
+    editSnapshot[k] = editBody()[k];
+    changed = true;
+  }
+  if (changed) syncPickers();
 }
 
 // switchEdit switches the open sheet to a different task (subtask, link) —
@@ -1162,49 +1246,54 @@ async function switchEdit(id) {
 }
 
 function openEdit(id) {
-  editId = id;
+  // Look it up first: a task deleted elsewhere must not become editId while
+  // the form still shows the previous one (the next re-render would close
+  // the sheet and drop its unsaved edits).
   const t = byId(id);
   if (!t) return;
+  editId = id;
   fillEditForm(t);
   fillParentSelect(t);
+  editSnapshot = editBody();
   refreshEditLists();
-  editSnapshot = editState();
   if (!editDlg.open) editDlg.showModal();
 }
 
 $('#edit-cancel').addEventListener('click', () => editDlg.close());
 // Deliberately NO closing via a backdrop click: an accidental tap nearby
 // would otherwise discard unsaved input. Only "Save" or "Cancel" close
-// the sheet.
+// the sheet — Esc and the Android back gesture ask first.
+editDlg.addEventListener('cancel', async (e) => {
+  if (!editDirty()) return;
+  e.preventDefault();
+  if (await confirmDlg(t('edit.discard_confirm'), t('edit.discard'))) editDlg.close();
+});
 editDlg.addEventListener('close', () => { editId = null; });
 
-$('#edit-save').addEventListener('click', async () => {
+$('#edit-save').addEventListener('click', () => busy($('#edit-save'), async () => {
   const task = byId(editId);
   if (!task) return;
-  const parentVal = $('#edit-parent').value;
-  const body = {
-    title: $('#edit-title').value.trim(),
-    note: $('#edit-note').value.trim(),
-    due_date: $('#edit-date').value,
-    due_time: $('#edit-time').value,
-    recurrence: parentVal ? '' : editRec,
-    pinned: parentVal ? false : editPinned,
-    in_progress: parentVal ? false : editProgress,
-    priority: editPrio,
-    // Subtasks follow their parent task — so don't send a list in that case.
-    list_id: parentVal ? undefined : Number($('#edit-list').value),
-    parent_id: parentVal ? Number(parentVal) : null,
-  };
-  try {
-    const res = await api(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify(body) });
-    if (await failed(res, t('task.save_failed'))) return;
-  } catch {
-    return;
+  const body = editChanges();
+  // As a subtask, the task moves into its parent's list — if others can see
+  // that list, say so first.
+  if (body.parent_id) {
+    const parent = byId(body.parent_id);
+    const target = parent && listById(parent.list_id);
+    if (target && target.id !== task.list_id && sharedList(target) &&
+        !(await confirmDlg(t('edit.move_shared_confirm', { name: listLabelFull(target) }), t('edit.move')))) return;
+  }
+  if (Object.keys(body).length) {
+    try {
+      const res = await api(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify(body) });
+      if (await failed(res, t('task.save_failed'))) return;
+    } catch {
+      return;
+    }
   }
   editDlg.close();
   toast(t('task.saved'));
   loadTasks();
-});
+}));
 
 $('#edit-delete').addEventListener('click', () => {
   const t = byId(editId);
@@ -1302,6 +1391,33 @@ function renderChips() {
   for (const b of chips) b.setAttribute('aria-pressed', String(b.classList.contains('active')));
 }
 
+// Invitations above the list: someone else's list only becomes visible (and
+// only reminds) once accepted. Declining is leaving the list.
+function renderInvites() {
+  const box = $('#invites');
+  box.replaceChildren(...INVITES.map((inv) => {
+    const row = el('div', 'invite');
+    const text = el('div', 'invite-text', t('invite.text', { owner: inv.owner_name, name: inv.name ?? t('lists.default') }));
+    const answer = (btn, call) => btn.addEventListener('click', () => busy(btn, async () => {
+      const r = await call();
+      if (await failed(r)) return;
+      lastRendered = '';
+      await loadTasks();
+    }).catch(() => {}));
+    const accept = el('button', 'textbtn strong', t('invite.accept'));
+    accept.type = 'button';
+    answer(accept, () => api(`/api/lists/${inv.list_id}/accept`, { method: 'POST' }));
+    const decline = el('button', 'textbtn', t('invite.decline'));
+    decline.type = 'button';
+    answer(decline, async () => api(`/api/lists/${inv.list_id}/members/${await myId()}`, { method: 'DELETE' }));
+    const btns = el('div', 'invite-btns');
+    btns.append(accept, decline);
+    row.append(icon('people'), text, btns);
+    return row;
+  }));
+  box.hidden = INVITES.length === 0;
+}
+
 // A click right after a long press doesn't also open the list;
 // each new touch (pointerdown) resets the flag.
 let chipLongPress = false;
@@ -1357,6 +1473,7 @@ async function fillShare(l) {
     const li = el('li', 'minirow');
     const body = el('div', 'body');
     body.append(el('div', 'title', p.name));
+    if (p.pending) body.append(el('div', 'meta', t('lists.invited')));
     li.append(body);
     if (own) {
       const del = el('button', 'rowbtn del');
@@ -1403,12 +1520,18 @@ async function refreshListDialog(id) {
   await fillShare(l);
 }
 
+// Sharing is an invitation: the list only shows up for the other person once
+// they accept it.
 $('#share-add').addEventListener('click', () => busy($('#share-add'), async () => {
   const l = listEditing;
-  const uid = $('#share-person').value;
+  const sel = $('#share-person');
+  const uid = sel.value;
   if (!l || !uid) return;
-  const r = await api(`/api/lists/${l.id}/members/${uid}`, { method: 'PUT' });
+  const name = sel.selectedOptions[0]?.textContent || '';
+  const r = await withReauth(() => api(`/api/lists/${l.id}/members/${uid}`, { method: 'PUT' }));
+  if (!r) return;
   if (await failed(r, t('task.save_failed'))) return;
+  toast(t('lists.invite_sent', { name }));
   await refreshListDialog(l.id);
 }).catch(() => {}));
 
@@ -1578,13 +1701,14 @@ function fmtDateNum(iso) {
   return isNaN(d) ? '' : new Intl.DateTimeFormat(FMT_LOCALE, { day: '2-digit', month: '2-digit', year: 'numeric' }).format(d);
 }
 
-// Managing passkeys requires a fresh confirmation (requireFreshAuth on the
-// server): if the last sign-in was too long ago, it responds with
-// {"reauth": true}. Then sign in once more via passkey and retry — a
-// hijacked session cookie alone isn't enough to swap passkeys this way.
+// Managing passkeys, accounts, sharing, the webhook and importing require a
+// fresh confirmation (requireFreshAuth on the server): if the last sign-in
+// was too long ago, it responds with {"reauth": true}. Then confirm once
+// more via passkey and retry — a hijacked session cookie alone isn't enough
+// this way. Only this account's passkeys count, and the session stays.
 async function reauth() {
   toast(t('passkeys.reauth'));
-  await passkeyLogin();
+  await passkeyReauth();
 }
 
 async function loadPasskeys() {
@@ -1674,7 +1798,8 @@ async function loadUsers() {
       const codeBtn = el('button', 'textbtn', t('users.new_code'));
       codeBtn.type = 'button';
       codeBtn.addEventListener('click', () => busy(codeBtn, async () => {
-        const r = await api(`/api/users/${u.id}/code`, { method: 'POST' });
+        const r = await withReauth(() => api(`/api/users/${u.id}/code`, { method: 'POST' }));
+        if (!r) return;
         if (await failed(r, t('error.internal'))) return;
         await showCode(u.name, (await r.json()).code);
       }).catch(() => {}));
@@ -1701,7 +1826,8 @@ async function loadUsers() {
 $('#add-user').addEventListener('click', () => busy($('#add-user'), async () => {
   const name = $('#user-name').value.trim();
   if (!name) return;
-  const r = await api('/api/users', { method: 'POST', body: JSON.stringify({ name }) });
+  const r = await withReauth(() => api('/api/users', { method: 'POST', body: JSON.stringify({ name }) }));
+  if (!r) return;
   if (await failed(r, t('error.internal'))) return;
   const d = await r.json();
   $('#user-name').value = '';
@@ -1782,7 +1908,9 @@ $('#settings-form').addEventListener('submit', async (e) => {
     archive_days: Number($('#set-archive').value),
   };
   try {
-    const res = await api('/api/settings', { method: 'PUT', body: JSON.stringify(body) });
+    // A changed webhook needs a fresh confirmation (where task titles go)
+    const res = await withReauth(() => api('/api/settings', { method: 'PUT', body: JSON.stringify(body) }));
+    if (!res) return;
     if (await failed(res, t('task.save_failed'))) return;
     toast(t('task.saved'));
     loadTasks(); // time zone can change sorting/today
@@ -2022,8 +2150,11 @@ $('#export-btn').addEventListener('click', async () => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `todo-backup-${TODAY}.json`;
+    document.body.append(a);
     a.click();
-    URL.revokeObjectURL(a.href);
+    a.remove();
+    // Revoked right after click(), Safari and older Firefox abort the download.
+    setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
   } catch {}
 });
 
@@ -2042,6 +2173,12 @@ $('#import-file').addEventListener('change', async () => {
     return;
   }
   try {
+    // Replacing everything needs a fresh confirmation — asked for before the
+    // upload: a large body that the server rejects unread can end up as a
+    // connection reset instead of the 403.
+    const fresh = await withReauth(() => api('/api/auth/fresh'));
+    if (!fresh) return;
+    if (await failed(fresh)) return;
     const res = await api('/api/import', { method: 'POST', body: text });
     if (await failed(res, t('error.import_failed'))) return;
     toast(t('backup.imported'));

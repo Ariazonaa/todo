@@ -283,26 +283,16 @@ func TestDeleteUser(t *testing.T) {
 	setUserSetting(s.db, b, "tz", "Europe/Vienna")
 	at := mustCreate(t, s, `{"title":"A"}`)
 	// Without a fresh login: 403 reauth
-	mustCreateSession(t, s.db, "alt", time.Now().Add(time.Hour), 0, testUID)
-	stale := time.Now().Add(-reauthWindow - time.Minute).UTC().Format(time.RFC3339)
-	s.db.Exec("UPDATE sessions SET auth_at = ? WHERE token = ?", stale, hashToken("alt"))
-	req := withUser(httptest.NewRequest("DELETE", "/", nil), testUID)
-	req.AddCookie(&http.Cookie{Name: s.cookieName(sessionCookie), Value: "alt"})
-	req.SetPathValue("id", fmt.Sprint(b))
-	rec := httptest.NewRecorder()
-	s.handleDeleteUser(rec, req)
-	if rec.Code != http.StatusForbidden {
+	if rec := serveAuthed(s, s.handleDeleteUser, staleRequest(t, s, testUID, "DELETE", "", "id", fmt.Sprint(b))); rec.Code != http.StatusForbidden {
 		t.Fatalf("ohne Frische: %d", rec.Code)
 	}
 	// Freshly logged in
 	mustCreateSession(t, s.db, "frisch", time.Now().Add(time.Hour), 0, testUID)
 	del := func(id int64) int {
-		req := withUser(httptest.NewRequest("DELETE", "/", nil), testUID)
+		req := httptest.NewRequest("DELETE", "/", nil)
 		req.AddCookie(&http.Cookie{Name: s.cookieName(sessionCookie), Value: "frisch"})
 		req.SetPathValue("id", fmt.Sprint(id))
-		rec := httptest.NewRecorder()
-		s.handleDeleteUser(rec, req)
-		return rec.Code
+		return serveAuthed(s, s.handleDeleteUser, req).Code
 	}
 	if code := del(testUID); code != http.StatusConflict {
 		t.Fatalf("eigenes Konto: %d", code)
@@ -322,6 +312,79 @@ func TestDeleteUser(t *testing.T) {
 	}
 	if s.authed(requestWithSession(s, "b-tok")) {
 		t.Fatal("B's Sitzung lebt noch")
+	}
+}
+
+var staleTokens int
+
+// staleRequest: a request as uid from a session whose passkey login is
+// longer ago than reauthWindow (a stolen cookie, say) — serve it with
+// serveAuthed, like the router does.
+func staleRequest(t *testing.T, s *server, uid int64, method, body string, pv ...string) *http.Request {
+	t.Helper()
+	staleTokens++
+	token := fmt.Sprintf("alt-%d-%d", uid, staleTokens)
+	mustCreateSession(t, s.db, token, time.Now().Add(time.Hour), 0, uid)
+	stale := time.Now().Add(-reauthWindow - time.Minute).UTC().Format(time.RFC3339)
+	s.db.Exec("UPDATE sessions SET auth_at = ? WHERE token = ?", stale, hashToken(token))
+	req := httptest.NewRequest(method, "/", strings.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: s.cookieName(sessionCookie), Value: token})
+	for i := 0; i+1 < len(pv); i += 2 {
+		req.SetPathValue(pv[i], pv[i+1])
+	}
+	return req
+}
+
+// With a stolen session cookie alone, creating an account or a new setup
+// code would be lasting access — like managing passkeys, both need a fresh
+// login.
+func TestAccountManagementNeedsFreshAuth(t *testing.T) {
+	s := testServer(t)
+	b := mustUser(t, s, "Bea")
+	for name, c := range map[string]struct {
+		h    http.HandlerFunc
+		body string
+		pv   []string
+	}{
+		"Konto anlegen": {s.handleCreateUser, `{"name":"Mallory"}`, nil},
+		"neuer Code":    {s.handleNewUserCode, "", []string{"id", fmt.Sprint(b)}},
+	} {
+		rec := serveAuthed(s, c.h, staleRequest(t, s, testUID, "POST", c.body, c.pv...))
+		var body map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &body)
+		if rec.Code != http.StatusForbidden || body["reauth"] != true {
+			t.Errorf("%s mit alter Sitzung: %d %s", name, rec.Code, rec.Body)
+		}
+	}
+	var n, codes int
+	s.db.QueryRow("SELECT COUNT(*), COUNT(setup_hash) FROM users").Scan(&n, &codes)
+	if n != 2 || codes != 0 {
+		t.Fatalf("%d Konten, %d Codes — trotz 403 geändert", n, codes)
+	}
+}
+
+// The webhook decides where task titles go: changing it needs a fresh
+// login, everything else in the form doesn't.
+func TestWebhookChangeNeedsFreshAuth(t *testing.T) {
+	s := testServer(t)
+	hook := "https://discord.com/api/webhooks/1/a"
+	put := func(body string) int {
+		return serveAuthed(s, s.handlePutSettings, staleRequest(t, s, testUID, "PUT", body)).Code
+	}
+	if code := put(`{"webhook_url":"` + hook + `","tz":"Europe/Berlin","digest_time":"09:00","archive_days":30}`); code != http.StatusForbidden {
+		t.Fatalf("Webhook setzen mit alter Sitzung: %d, erwartet 403", code)
+	}
+	if got := s.store.get(testUID).WebhookURL; got != "" {
+		t.Fatalf("Webhook trotz 403 gesetzt: %q", got)
+	}
+	if code := put(`{"webhook_url":"","tz":"Europe/Vienna","digest_time":"08:00","archive_days":30}`); code != http.StatusOK {
+		t.Fatalf("nur Zeitzone mit alter Sitzung: %d, erwartet 200", code)
+	}
+	if rec := call(t, s.handlePutSettings, "PUT", "/", strings.NewReader(`{"webhook_url":"`+hook+`","tz":"Europe/Vienna","digest_time":"08:00","archive_days":30}`)); rec.Code != http.StatusOK {
+		t.Fatalf("Webhook mit frischer Sitzung: %d %s", rec.Code, rec.Body)
+	}
+	if code := put(`{"webhook_url":"` + hook + `","tz":"Europe/Berlin","digest_time":"08:00","archive_days":30}`); code != http.StatusOK {
+		t.Fatalf("unveränderter Webhook mit alter Sitzung: %d, erwartet 200", code)
 	}
 }
 

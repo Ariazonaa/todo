@@ -23,11 +23,21 @@ const (
 
 type ctxKey int
 
-const userKey ctxKey = 1
+const (
+	userKey ctxKey = 1
+	// authAtKey: when the request's session last signed in with a passkey
+	// (requireAuth reads it along with the session; requireFreshAuth).
+	authAtKey ctxKey = 2
+)
 
 // withUser stores the logged-in person on the request (requireAuth).
 func withUser(r *http.Request, uid int64) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), userKey, uid))
+}
+
+// withAuthAt stores the time of the session's passkey login.
+func withAuthAt(r *http.Request, at time.Time) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), authAtKey, at))
 }
 
 // userID: the logged-in person; 0 when not logged in — then there is no data.
@@ -51,7 +61,7 @@ type User struct {
 const maxUserNameLen = 40
 
 func userName(raw string) (string, error) {
-	name := strings.TrimSpace(raw)
+	name := strings.TrimSpace(cleanName(raw))
 	if n := utf8.RuneCountInString(name); n == 0 || n > maxUserNameLen {
 		return "", uerr("error.user_name")
 	}
@@ -138,6 +148,10 @@ func deleteUser(db *sql.DB, uid int64) error {
 		{"DELETE FROM user_settings WHERE user_id = ?", []any{uid}},
 		{"DELETE FROM stats WHERE user_id = ?", []any{uid}},
 		{"DELETE FROM task_reminders WHERE user_id = ?", []any{uid}},
+		{"DELETE FROM import_attachments WHERE user_id = ?", []any{uid}},
+		// Their completions in other people's lists: reopening them takes back
+		// no one's stat (0) — not the stat of whoever happens to reopen it.
+		{"UPDATE tasks SET completed_by = 0 WHERE completed_by = ?", []any{uid}},
 		{"DELETE FROM users WHERE id = ? AND is_admin = 0", []any{uid}},
 	} {
 		if _, err := tx.Exec(q.sql, q.args...); err != nil {
@@ -179,11 +193,21 @@ func (s *server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 		u.IsAdmin, u.HasPasskey, u.CodePending = admin == 1, pk == 1, pending == 1
 		out = append(out, u)
 	}
+	if rows.Err() != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
+// handleCreateUser: like managing passkeys, only with a fresh login — with
+// a stolen session cookie alone, an attacker could otherwise create an
+// account of their own and keep access after "sign out everywhere".
 func (s *server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
+		return
+	}
+	if !s.requireFreshAuth(w, r) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
@@ -232,7 +256,8 @@ func (s *server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleNewUserCode: a new setup code (the old one becomes invalid) — only
-// for accounts that don't have a passkey yet.
+// for accounts that don't have a passkey yet, and only with a fresh login
+// (a code is an account takeover in waiting).
 func (s *server) handleNewUserCode(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
@@ -240,6 +265,9 @@ func (s *server) handleNewUserCode(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "error.bad_id")
+		return
+	}
+	if !s.requireFreshAuth(w, r) {
 		return
 	}
 	var exists, creds int

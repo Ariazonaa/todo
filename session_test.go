@@ -184,9 +184,17 @@ func TestPurgeSessionsClampsLegacyLifetimes(t *testing.T) {
 	}
 }
 
-// passkeyReq is a request from session token.
+// serveAuthed runs h behind requireAuth, as the router does — the session
+// cookie on req decides who's asking and whether the login is fresh.
+func serveAuthed(s *server, h http.HandlerFunc, req *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	s.requireAuth(h).ServeHTTP(rec, req)
+	return rec
+}
+
+// passkeyReq is a request from session token (serve it with serveAuthed).
 func passkeyReq(s *server, method, token, id string) *http.Request {
-	req := withUser(httptest.NewRequest(method, "/api/passkeys/"+id, nil), testUID)
+	req := httptest.NewRequest(method, "/api/passkeys/"+id, nil)
 	req.AddCookie(&http.Cookie{Name: s.cookieName(sessionCookie), Value: token})
 	if id != "" {
 		req.SetPathValue("id", id)
@@ -220,8 +228,7 @@ func TestPasskeyManagementNeedsFreshAuth(t *testing.T) {
 	laptop := mustInsertCredential(t, s.db, "Laptop")
 
 	for name, h := range map[string]http.HandlerFunc{"begin": s.handlePasskeyBegin, "delete": s.handlePasskeyDelete} {
-		rec := httptest.NewRecorder()
-		h(rec, passkeyReq(s, http.MethodPost, "alt", fmt.Sprint(laptop)))
+		rec := serveAuthed(s, h, passkeyReq(s, http.MethodPost, "alt", fmt.Sprint(laptop)))
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("%s mit alter Sitzung: %d, erwartet 403", name, rec.Code)
 		}
@@ -240,9 +247,7 @@ func TestPasskeyManagementNeedsFreshAuth(t *testing.T) {
 	// Freshly signed in: deleting works, the last one stays protected, and one
 	// that's already deleted is 404 instead of "the last passkey".
 	del := func(id int64) int {
-		rec := httptest.NewRecorder()
-		s.handlePasskeyDelete(rec, passkeyReq(s, http.MethodDelete, "frisch", fmt.Sprint(id)))
-		return rec.Code
+		return serveAuthed(s, s.handlePasskeyDelete, passkeyReq(s, http.MethodDelete, "frisch", fmt.Sprint(id))).Code
 	}
 	if code := del(laptop); code != http.StatusNoContent {
 		t.Fatalf("löschen mit frischer Sitzung: %d", code)
@@ -318,5 +323,19 @@ func TestSessionMigrationAddsCredentialColumn(t *testing.T) {
 	}
 	if err := createSession(db, "neu", time.Now().Add(time.Hour), 3, testUID); err != nil {
 		t.Fatalf("createSession nach Migration: %v", err)
+	}
+}
+
+// A request that read the session just before it was retired must not
+// renew it back to the full idle timeout.
+func TestRenewDoesNotReviveRetiredSession(t *testing.T) {
+	s := sessionServer(t)
+	mustCreateSession(t, s.db, "alt", time.Now().Add(sessionIdleTimeout/2-time.Hour), 1, testUID)
+	retireSession(s.db, "alt", sessionRetireGrace)
+	if err := renewSession(s.db, "alt", time.Now().Add(sessionIdleTimeout)); err != nil {
+		t.Fatal(err)
+	}
+	if exp, ok := sessionExpiry(s.db, "alt"); !ok || exp.After(time.Now().Add(sessionRetireGrace+time.Minute)) {
+		t.Fatalf("ausgemusterte Sitzung wurde verlängert: %v %v", exp, ok)
 	}
 }

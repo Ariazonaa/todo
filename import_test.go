@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,7 +46,16 @@ func postImportAs(t *testing.T, s *server, uid int64, data exportData) *httptest
 		t.Fatalf("marshal: %v", err)
 	}
 	rec := httptest.NewRecorder()
-	s.handleImport(rec, withUser(httptest.NewRequest(http.MethodPost, "/api/import", strings.NewReader(string(body))), uid))
+	s.handleImport(rec, freshUser(httptest.NewRequest(http.MethodPost, "/api/import", strings.NewReader(string(body))), uid))
+	return rec
+}
+
+// postImportRaw replays a backup given as JSON text (for fields that a
+// marshalled exportData can't leave out).
+func postImportRaw(t *testing.T, s *server, uid int64, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.handleImport(rec, freshUser(httptest.NewRequest(http.MethodPost, "/api/import", strings.NewReader(body)), uid))
 	return rec
 }
 
@@ -299,5 +309,43 @@ func TestImportAcceptsValidBackup(t *testing.T) {
 	}
 	if stats != 1 {
 		t.Fatalf("kaputte/negative Tageszähler hätten wegfallen müssen, bekam %d", stats)
+	}
+}
+
+// One element may not take memory up to the body limit: a huge note (or
+// image) aborts the import while decoding.
+func TestImportRejectsHugeElement(t *testing.T) {
+	s := testServer(t)
+	huge := strings.Repeat("x", maxImportElement+1)
+	rec := postImportRaw(t, s, testUID, `{"tasks":[{"id":1,"title":"a","created_at":"z","note":"`+huge+`"}]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("erwartet 400, bekam %d", rec.Code)
+	}
+	// Many normal elements together may well exceed the per-element cap
+	var b strings.Builder
+	b.WriteString(`{"tasks":[`)
+	for i := 1; i <= maxImportElement/maxNoteLen+100; i++ {
+		if i > 1 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"id":%d,"title":"t","created_at":"z","note":"%s"}`, i, strings.Repeat("n", maxNoteLen))
+	}
+	b.WriteString(`]}`)
+	if rec := postImportRaw(t, s, testUID, b.String()); rec.Code != http.StatusNoContent {
+		t.Fatalf("normaler Import: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// Timestamps are stored in UTC: "+02:00" would compare wrong as a string.
+func TestImportNormalizesTimestamps(t *testing.T) {
+	s := testServer(t)
+	rec := postImportRaw(t, s, testUID, `{"tasks":[{"id":1,"title":"a","done":true,"created_at":"2024-01-01T10:00:00+02:00","completed_at":"2024-01-02T10:00:00.5+02:00"}]}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("Import: %d %s", rec.Code, rec.Body)
+	}
+	var created, completed string
+	s.db.QueryRow("SELECT created_at, completed_at FROM tasks WHERE title = 'a'").Scan(&created, &completed)
+	if created != "2024-01-01T08:00:00Z" || completed != "2024-01-02T08:00:00Z" {
+		t.Fatalf("created_at=%q completed_at=%q", created, completed)
 	}
 }

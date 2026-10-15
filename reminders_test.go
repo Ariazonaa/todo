@@ -11,7 +11,7 @@ func TestSharedTaskRemindsEveryone(t *testing.T) {
 	s := &server{db: sc.db, store: sc.store, hub: sc.hub}
 	bea := mustUser(t, s, "Bea")
 	haus := mustList(t, s, "Haushalt")
-	callAs(t, testUID, s.handleAddMember, "PUT", "/", nil, "id", fmt.Sprint(haus.ID), "uid", fmt.Sprint(bea))
+	share(t, s, testUID, haus.ID, bea)
 	mustCreate(t, s, fmt.Sprintf(`{"title":"Müll","list_id":%d,"due_date":"2026-03-01","due_time":"08:00"}`, haus.ID))
 	dA, urlA := newDiscordStub(t)
 	dB, urlB := newDiscordStub(t)
@@ -48,7 +48,7 @@ func TestDigestIncludesSharedTasks(t *testing.T) {
 	s := &server{db: sc.db, store: sc.store, hub: sc.hub}
 	bea := mustUser(t, s, "Bea")
 	haus := mustList(t, s, "Haushalt")
-	callAs(t, testUID, s.handleAddMember, "PUT", "/", nil, "id", fmt.Sprint(haus.ID), "uid", fmt.Sprint(bea))
+	share(t, s, testUID, haus.ID, bea)
 	mustCreate(t, s, fmt.Sprintf(`{"title":"Müll","list_id":%d,"due_date":"2026-03-01"}`, haus.ID))
 	today, _, err := sc.digestTasks(bea, "2026-03-01")
 	if err != nil || len(today) != 1 {

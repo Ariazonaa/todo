@@ -185,7 +185,7 @@ func TestLoadCatalogsRejectsBrokenFiles(t *testing.T) {
 // errorOf calls h with X-Lang set to lang and returns the error message.
 func errorOf(t *testing.T, h http.HandlerFunc, lang, method, target, body string, pv ...string) (int, string) {
 	t.Helper()
-	req := withUser(httptest.NewRequest(method, target, strings.NewReader(body)), testUID)
+	req := freshUser(httptest.NewRequest(method, target, strings.NewReader(body)), testUID)
 	req.Header.Set("X-Lang", lang)
 	for i := 0; i+1 < len(pv); i += 2 {
 		req.SetPathValue(pv[i], pv[i+1])
@@ -455,8 +455,7 @@ func TestFreshAuthMessageFollowsLanguage(t *testing.T) {
 	}
 	req := passkeyReq(s, http.MethodPost, "alt", "1")
 	req.Header.Set("X-Lang", "en")
-	rec := httptest.NewRecorder()
-	s.handlePasskeyBegin(rec, req)
+	rec := serveAuthed(s, s.handlePasskeyBegin, req)
 	var body struct {
 		Error  string
 		Reauth bool

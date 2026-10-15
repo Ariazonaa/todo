@@ -10,7 +10,6 @@ import (
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,6 +18,13 @@ import (
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
+
+// maxAttachmentBytesPerOwner: images per list owner in total (members fill
+// the owner's lists), so that every export still fits back into the import:
+// the backup carries images base64-encoded (4/3 of their size), and 5/8 of
+// maxImportBytes leaves about 1/6 of it for the tasks themselves. A
+// variable so tests can lower it.
+var maxAttachmentBytesPerOwner int64 = maxImportBytes / 8 * 5
 
 const (
 	maxAttachmentSize     = 15 << 20 // 15 MB (the client compresses to ~2048px JPEG beforehand)
@@ -39,6 +45,18 @@ const (
 // multiply the limit above.
 var decodeSlot = make(chan struct{}, 1)
 
+// Uploads are read into memory whole (up to maxAttachmentSize each): at most
+// two per person and six overall at a time — dozens in parallel would
+// otherwise blow through the container's memory limit.
+var (
+	userUploads = newUserSlots(2)
+	uploadSlots = make(chan struct{}, 6)
+)
+
+// uploadSlotWait: how long an upload waits for a free slot before it's
+// turned away (the client retries a few times).
+const uploadSlotWait = 10 * time.Second
+
 // checkImageDimensions reads only the header and rejects oversized images
 // before anything gets decoded (and thus allocated).
 func checkImageDimensions(data []byte) error {
@@ -57,13 +75,18 @@ func checkImageDimensions(data []byte) error {
 
 // makeThumb creates a small JPEG thumbnail (max thumbMax px) for list rendering.
 func makeThumb(data []byte) ([]byte, error) {
+	decodeSlot <- struct{}{}
+	defer func() { <-decodeSlot }()
+	return makeThumbInSlot(data)
+}
+
+// makeThumbInSlot is makeThumb for a caller already holding decodeSlot.
+func makeThumbInSlot(data []byte) ([]byte, error) {
 	// Check here too, not just on upload: the lazy backfill feeds this with
 	// existing images from the DB that never went through this check.
 	if err := checkImageDimensions(data); err != nil {
 		return nil, err
 	}
-	decodeSlot <- struct{}{}
-	defer func() { <-decodeSlot }()
 	src, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -159,14 +182,68 @@ func attachmentBelongsToTask(db *sql.DB, uid, attachmentID, taskID int64) (bool,
 	return n > 0, nil
 }
 
+// overImageLimit: would size more bytes of images put the owner of list over
+// maxAttachmentBytesPerOwner? SUM(length()) doesn't read the image data.
+func (s *server) overImageLimit(list, size int64) (bool, error) {
+	var used int64
+	err := s.db.QueryRow("SELECT COALESCE(SUM(length(data)), 0) FROM attachments WHERE task_id IN "+
+		"(SELECT id FROM tasks WHERE list_id IN (SELECT id FROM lists WHERE owner_id = (SELECT owner_id FROM lists WHERE id = ?)))",
+		list).Scan(&used)
+	return used+size > maxAttachmentBytesPerOwner, err
+}
+
 func (s *server) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.taskFromPath(w, r)
 	if !ok {
 		return
 	}
+	uid := userID(r)
+	// What the declared length already rules out is turned away before
+	// waiting for a slot or reading anything.
+	if r.ContentLength > maxAttachmentSize {
+		writeError(w, r, http.StatusRequestEntityTooLarge, "error.image_too_big")
+		return
+	}
+	if r.ContentLength > 0 {
+		if over, err := s.overImageLimit(t.ListID, r.ContentLength); err != nil {
+			writeError(w, r, http.StatusInternalServerError, "error.internal")
+			return
+		} else if over {
+			writeError(w, r, http.StatusConflict, "error.storage_limit", "n", maxAttachmentBytesPerOwner>>20)
+			return
+		}
+	}
+	if !userUploads.acquire(uid) {
+		writeError(w, r, http.StatusTooManyRequests, "error.uploads_busy")
+		return
+	}
+	defer userUploads.release(uid)
+	wait := time.NewTimer(uploadSlotWait)
+	defer wait.Stop()
+	// r.Context() only ends once the body has been read — a client that
+	// gave up still holds its place until the wait runs out.
+	select {
+	case uploadSlots <- struct{}{}:
+		defer func() { <-uploadSlots }()
+	case <-wait.C:
+		writeError(w, r, http.StatusServiceUnavailable, "error.uploads_busy")
+		return
+	case <-s.shutdown:
+		writeError(w, r, http.StatusServiceUnavailable, "error.uploads_busy")
+		return
+	case <-r.Context().Done():
+		return
+	}
 	extendReadDeadline(w, 5*time.Minute) // 15 MB over a mobile connection
 	r.Body = http.MaxBytesReader(w, r.Body, maxAttachmentSize)
-	data, err := io.ReadAll(r.Body)
+	// Sized up front when the length is known: io.ReadAll grows by doubling
+	// and can briefly hold twice the image.
+	var buf bytes.Buffer
+	if n := r.ContentLength; n > 0 && n <= maxAttachmentSize {
+		buf.Grow(int(n) + bytes.MinRead)
+	}
+	_, err := buf.ReadFrom(r.Body)
+	data := buf.Bytes()
 	if _, tooBig := errors.AsType[*http.MaxBytesError](err); tooBig {
 		writeError(w, r, http.StatusRequestEntityTooLarge, "error.image_too_big")
 		return
@@ -183,6 +260,13 @@ func (s *server) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) 
 	mime := http.DetectContentType(data)
 	if !allowedImageMimes[mime] {
 		writeError(w, r, http.StatusBadRequest, "error.image_type")
+		return
+	}
+	if over, err := s.overImageLimit(t.ListID, int64(len(data))); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	} else if over {
+		writeError(w, r, http.StatusConflict, "error.storage_limit", "n", maxAttachmentBytesPerOwner>>20)
 		return
 	}
 	// Before decoding: otherwise a small file is enough to push the
@@ -202,7 +286,7 @@ func (s *server) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) 
 	// up on whichever task gets the same ID next — tasks.id is reused.
 	res, err := s.db.Exec("INSERT INTO attachments (task_id, mime, created_at, data, thumb) "+
 		"SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND list_id "+visibleLists+")",
-		t.ID, mime, time.Now().UTC().Format(time.RFC3339), data, thumb, t.ID, userID(r))
+		t.ID, mime, time.Now().UTC().Format(time.RFC3339), data, thumb, t.ID, uid)
 	if err != nil {
 		// The attachments_limit trigger aborts with RAISE(ABORT, …)
 		if strings.Contains(err.Error(), "attachment limit reached") {
@@ -274,12 +358,18 @@ func (s *server) handleAttachmentThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	var mime string
 	var thumb, data []byte
-	if err := s.db.QueryRow("SELECT mime, thumb, data FROM attachments WHERE id = ? AND task_id = ? "+
-		"AND task_id IN (SELECT id FROM tasks WHERE list_id "+visibleLists+")", id, taskID, userID(r)).Scan(&mime, &thumb, &data); err != nil {
+	if err := s.db.QueryRow("SELECT mime, thumb FROM attachments WHERE id = ? AND task_id = ? "+
+		"AND task_id IN (SELECT id FROM tasks WHERE list_id "+visibleLists+")", id, taskID, userID(r)).Scan(&mime, &thumb); err != nil {
 		writeError(w, r, http.StatusNotFound, "error.image_not_found")
 		return
 	}
+	// The original (up to 15 MB) only when there's no thumbnail yet — the list
+	// fetches every thumbnail at once.
 	if thumb == nil {
+		if err := s.db.QueryRow("SELECT data FROM attachments WHERE id = ?", id).Scan(&data); err != nil {
+			writeError(w, r, http.StatusNotFound, "error.image_not_found")
+			return
+		}
 		if t, err := makeThumb(data); err == nil {
 			thumb = t
 			s.db.Exec("UPDATE attachments SET thumb = ? WHERE id = ?", t, id)

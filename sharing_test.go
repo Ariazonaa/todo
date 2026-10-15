@@ -9,9 +9,137 @@ import (
 	"testing"
 )
 
+// share: owner invites member, and member accepts — a fully shared list.
 func share(t *testing.T, s *server, owner int64, list, member int64) *httptest.ResponseRecorder {
 	t.Helper()
+	rec := invite(t, s, owner, list, member)
+	if rec.Code == http.StatusNoContent {
+		if acc := callAs(t, member, s.handleAcceptInvite, "POST", "/", nil, "id", fmt.Sprint(list)); acc.Code != http.StatusNoContent {
+			t.Fatalf("annehmen: %d %s", acc.Code, acc.Body)
+		}
+	}
+	return rec
+}
+
+func invite(t *testing.T, s *server, owner int64, list, member int64) *httptest.ResponseRecorder {
+	t.Helper()
 	return callAs(t, owner, s.handleAddMember, "PUT", "/", nil, "id", fmt.Sprint(list), "uid", fmt.Sprint(member))
+}
+
+// An invitation alone shows nothing: neither the list nor its tasks, no
+// reminders, no edits — until it's accepted. Declining removes it.
+func TestInvitationNeedsAcceptance(t *testing.T) {
+	s := testServer(t)
+	bea := mustUser(t, s, "Bea")
+	haus := mustList(t, s, "Haushalt")
+	task := mustCreate(t, s, fmt.Sprintf(`{"title":"Müll","list_id":%d,"due_date":"2026-03-01","due_time":"08:00"}`, haus.ID))
+	ch := s.hub.subscribe(bea)
+	if rec := invite(t, s, testUID, haus.ID, bea); rec.Code != http.StatusNoContent {
+		t.Fatalf("einladen: %d %s", rec.Code, rec.Body)
+	}
+	if !notified(ch) {
+		t.Fatal("Bea erfährt nichts von der Einladung")
+	}
+	var got struct {
+		Tasks   []Task   `json:"tasks"`
+		Lists   []List   `json:"lists"`
+		Invites []Invite `json:"invites"`
+	}
+	load := func(uid int64) {
+		got.Tasks, got.Lists, got.Invites = nil, nil, nil
+		json.Unmarshal(callAs(t, uid, s.handleListTasks, "GET", "/", nil).Body.Bytes(), &got)
+	}
+	load(bea)
+	if len(got.Tasks) != 0 || len(got.Lists) != 1 {
+		t.Fatalf("vor dem Annehmen sichtbar: %+v / %+v", got.Tasks, got.Lists)
+	}
+	if len(got.Invites) != 1 || got.Invites[0].ListID != haus.ID || got.Invites[0].OwnerName != "Admin" || *got.Invites[0].Name != "Haushalt" {
+		t.Fatalf("Einladungen %+v", got.Invites)
+	}
+	if rec := callAs(t, bea, s.handleCompleteTask, "POST", "/", nil, "id", fmt.Sprint(task.ID)); rec.Code != http.StatusNotFound {
+		t.Fatalf("abhaken vor dem Annehmen: %d", rec.Code)
+	}
+	if due, _ := newScheduler(s.db, s.store, s.hub, s.vapid).queryTasks("SELECT "+taskCols+" FROM tasks WHERE list_id "+visibleLists, bea); len(due) != 0 {
+		t.Fatalf("Erinnerungen vor dem Annehmen: %+v", due)
+	}
+	// The owner sees the person as invited
+	load(testUID)
+	if m := got.Lists[1].Members; len(m) != 1 || m[0].ID != bea || !m[0].Pending {
+		t.Fatalf("Mitglieder beim Eigentümer %+v", m)
+	}
+	// Someone without an invitation can't accept
+	cleo := mustUser(t, s, "Cleo")
+	if rec := callAs(t, cleo, s.handleAcceptInvite, "POST", "/", nil, "id", fmt.Sprint(haus.ID)); rec.Code != http.StatusNotFound {
+		t.Fatalf("ohne Einladung angenommen: %d", rec.Code)
+	}
+	if rec := callAs(t, bea, s.handleAcceptInvite, "POST", "/", nil, "id", fmt.Sprint(haus.ID)); rec.Code != http.StatusNoContent {
+		t.Fatalf("annehmen: %d %s", rec.Code, rec.Body)
+	}
+	load(bea)
+	if len(got.Tasks) != 1 || len(got.Invites) != 0 {
+		t.Fatalf("nach dem Annehmen: %+v / %+v", got.Tasks, got.Invites)
+	}
+	// Declining = leaving with one's own ID; works before accepting too
+	beas := mustListAs(t, s, bea, "Beas")
+	invite(t, s, bea, beas.ID, cleo)
+	if rec := callAs(t, cleo, s.handleRemoveMember, "DELETE", "/", nil, "id", fmt.Sprint(beas.ID), "uid", fmt.Sprint(cleo)); rec.Code != http.StatusNoContent {
+		t.Fatalf("ablehnen: %d %s", rec.Code, rec.Body)
+	}
+	load(cleo)
+	if len(got.Invites) != 0 {
+		t.Fatalf("Einladung nach dem Ablehnen: %+v", got.Invites)
+	}
+}
+
+// In a shared list, Bea reopening the admin's completion used to take the
+// count away from Bea — and the admin's next completion counted twice.
+func TestReopenTakesBackCompletersStat(t *testing.T) {
+	s := testServer(t)
+	bea := mustUser(t, s, "Bea")
+	haus := mustList(t, s, "Haushalt")
+	share(t, s, testUID, haus.ID, bea)
+	task := mustCreate(t, s, fmt.Sprintf(`{"title":"Müll","list_id":%d}`, haus.ID))
+	id := fmt.Sprint(task.ID)
+	stats := func(uid int64) int {
+		var st map[string]int
+		json.Unmarshal(callAs(t, uid, s.handleStats, "GET", "/", nil).Body.Bytes(), &st)
+		return st["today"]
+	}
+	// Bea completed something of her own today
+	beas := mustCreateAs(t, s, bea, `{"title":"Beas"}`)
+	callAs(t, bea, s.handleCompleteTask, "POST", "/", nil, "id", fmt.Sprint(beas.ID))
+
+	callAs(t, testUID, s.handleCompleteTask, "POST", "/", nil, "id", id)
+	callAs(t, bea, s.handleUncompleteTask, "POST", "/", nil, "id", id)
+	if a, b := stats(testUID), stats(bea); a != 0 || b != 1 {
+		t.Fatalf("nach Beas Wiederöffnen: Admin %d (erwartet 0), Bea %d (erwartet 1)", a, b)
+	}
+	callAs(t, testUID, s.handleCompleteTask, "POST", "/", nil, "id", id)
+	if a := stats(testUID); a != 1 {
+		t.Fatalf("Admin nach erneutem Erledigen: %d, erwartet 1", a)
+	}
+	// Completer deleted: reopening takes back nobody's count
+	other := mustCreate(t, s, fmt.Sprintf(`{"title":"Spülen","list_id":%d}`, haus.ID))
+	callAs(t, bea, s.handleCompleteTask, "POST", "/", nil, "id", fmt.Sprint(other.ID))
+	if err := deleteUser(s.db, bea); err != nil {
+		t.Fatal(err)
+	}
+	callAs(t, testUID, s.handleUncompleteTask, "POST", "/", nil, "id", fmt.Sprint(other.ID))
+	if a := stats(testUID); a != 1 {
+		t.Fatalf("Admin nach Wiederöffnen einer Erledigung der gelöschten Bea: %d, erwartet 1", a)
+	}
+}
+
+// Sharing is lasting access for another account: like managing passkeys,
+// only with a fresh login.
+func TestShareNeedsFreshAuth(t *testing.T) {
+	s := testServer(t)
+	bea := mustUser(t, s, "Bea")
+	haus := mustList(t, s, "Haushalt")
+	rec := serveAuthed(s, s.handleAddMember, staleRequest(t, s, testUID, "PUT", "", "id", fmt.Sprint(haus.ID), "uid", fmt.Sprint(bea)))
+	if rec.Code != http.StatusForbidden || isMember(s.db, haus.ID, bea) {
+		t.Fatalf("teilen mit alter Sitzung: %d", rec.Code)
+	}
 }
 
 // A member sees the list together with its tasks and can fully edit them.
@@ -169,7 +297,7 @@ func TestChangedReachesOnlyParticipants(t *testing.T) {
 	bea := mustUser(t, s, "Bea")
 	cleo := mustUser(t, s, "Cleo")
 	haus := mustList(t, s, "Haushalt")
-	callAs(t, testUID, s.handleAddMember, "PUT", "/", nil, "id", fmt.Sprint(haus.ID), "uid", fmt.Sprint(bea))
+	share(t, s, testUID, haus.ID, bea)
 	chB, chC := s.hub.subscribe(bea), s.hub.subscribe(cleo)
 	drain := func(ch chan struct{}) bool {
 		select {

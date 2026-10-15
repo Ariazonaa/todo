@@ -31,15 +31,10 @@ const (
 
 var b64u = base64.RawURLEncoding
 
+// e2eHandler: the app's real routing (main.go), without rate limits — the
+// tests fire thousands of ceremonies from one address.
 func e2eHandler(s *server) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/auth/login/begin", s.handleLoginBegin)
-	mux.HandleFunc("POST /api/auth/login/finish", s.handleLoginFinish)
-	mux.Handle("GET /api/tasks", s.requireAuth(http.HandlerFunc(s.handleListTasks)))
-	mux.Handle("POST /api/passkeys/begin", s.requireAuth(http.HandlerFunc(s.handlePasskeyBegin)))
-	mux.HandleFunc("POST /api/setup/begin", s.handleSetupBegin)
-	mux.HandleFunc("POST /api/setup/finish", s.handleSetupFinish)
-	return mux
+	return s.routes(newRateLimiter(1_000_000, 1_000_000), newRateLimiter(1_000_000, 1_000_000))
 }
 
 type softKey struct {
@@ -293,6 +288,97 @@ func TestReauthReplacesSessionWithGrace(t *testing.T) {
 	}
 	if exp, _ := sessionExpiry(s.db, old); time.Until(exp) > sessionRetireGrace {
 		t.Fatalf("ersetzte Sitzung läuft noch %v", time.Until(exp))
+	}
+}
+
+// reauth confirms the session with key; allowed returns the passkey IDs
+// begin offered.
+func (b *browser) reauth(t *testing.T, k *softKey, flags byte) (rec *httptest.ResponseRecorder, allowed []string) {
+	t.Helper()
+	begin := b.do(http.MethodPost, "/api/auth/reauth/begin", nil)
+	var opt struct {
+		PublicKey struct {
+			Challenge        string
+			AllowCredentials []struct{ ID string } `json:"allowCredentials"`
+		} `json:"publicKey"`
+	}
+	if err := json.Unmarshal(begin.Body.Bytes(), &opt); err != nil || opt.PublicKey.Challenge == "" {
+		t.Fatalf("reauth/begin: %d %s", begin.Code, begin.Body)
+	}
+	for _, c := range opt.PublicKey.AllowCredentials {
+		allowed = append(allowed, c.ID)
+	}
+	return b.do(http.MethodPost, "/api/auth/reauth/finish", k.assertion(t, opt.PublicKey.Challenge, flags)), allowed
+}
+
+// The confirmation before managing passkeys used to be a full login: on a
+// shared device, picking someone else's passkey silently switched accounts.
+// Now only the session's own account counts — and the session is still
+// replaced, so a copied cookie doesn't turn fresh along with it.
+func TestReauthOnlyAcceptsOwnPasskeyAndReplacesSession(t *testing.T) {
+	s, b := e2eSetup(t)
+	mine := newSoftKey(t)
+	mine.store(t, s, true)
+	bea := mustUser(t, s, "Bea")
+	theirs := newSoftKey(t)
+	theirs.storeFor(t, s, bea, true)
+	if rec := b.login(t, mine, flagUP|flagUV); rec.Code != http.StatusNoContent {
+		t.Fatalf("login: %d %s", rec.Code, rec.Body)
+	}
+	token := b.cookies[sessionCookie].Value
+	stale := time.Now().Add(-reauthWindow - time.Minute).UTC().Format(time.RFC3339)
+	s.db.Exec("UPDATE sessions SET auth_at = ? WHERE token = ?", stale, hashToken(token))
+	// An attacker holding a copy of the same cookie
+	thief := &browser{h: b.h, cookies: map[string]*http.Cookie{sessionCookie: b.cookies[sessionCookie]}}
+
+	rec, allowed := b.reauth(t, theirs, flagUP|flagUV)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("Bestätigung mit fremdem Passkey: %d, erwartet 401", rec.Code)
+	}
+	if len(allowed) != 1 || allowed[0] != b64u.EncodeToString(mine.id) {
+		t.Fatalf("angebotene Passkeys %v — erwartet nur den eigenen", allowed)
+	}
+	if rec := b.do(http.MethodPost, "/api/passkeys/begin", nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("nach fehlgeschlagener Bestätigung: %d, erwartet 403", rec.Code)
+	}
+	if rec, _ := b.reauth(t, mine, flagUP); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("Bestätigung ohne UV: %d, erwartet 401", rec.Code)
+	}
+	if rec, _ := b.reauth(t, mine, flagUP|flagUV); rec.Code != http.StatusNoContent {
+		t.Fatalf("Bestätigung: %d %s", rec.Code, rec.Body)
+	}
+	if b.cookies[sessionCookie].Value == token {
+		t.Fatal("Bestätigung hat keine neue Sitzung ausgestellt")
+	}
+	if rec := b.do(http.MethodPost, "/api/passkeys/begin", nil); rec.Code != http.StatusOK {
+		t.Fatalf("Passkey-begin nach Bestätigung: %d %s", rec.Code, rec.Body)
+	}
+	// The copy stays stale and expires after the grace period
+	if rec := thief.do(http.MethodGet, "/api/auth/fresh", nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("kopiertes Cookie nach der Bestätigung des Opfers: %d, erwartet 403", rec.Code)
+	}
+	if exp, _ := sessionExpiry(s.db, token); time.Until(exp) > sessionRetireGrace {
+		t.Fatalf("ersetzte Sitzung läuft noch %v", time.Until(exp))
+	}
+}
+
+// A re-auth ceremony belongs to the session that started it: finished from
+// another session (even of the same account) it doesn't count.
+func TestReauthCeremonyIsBoundToItsSession(t *testing.T) {
+	s, b := e2eSetup(t)
+	key := newSoftKey(t)
+	key.store(t, s, true)
+	b.login(t, key, flagUP|flagUV)
+	other := &browser{h: b.h, cookies: map[string]*http.Cookie{}}
+	other.login(t, key, flagUP|flagUV)
+	begin := b.do(http.MethodPost, "/api/auth/reauth/begin", nil)
+	var opt struct {
+		PublicKey struct{ Challenge string } `json:"publicKey"`
+	}
+	json.Unmarshal(begin.Body.Bytes(), &opt)
+	other.cookies[ceremonyCookie] = b.cookies[ceremonyCookie]
+	if rec := other.do(http.MethodPost, "/api/auth/reauth/finish", key.assertion(t, opt.PublicKey.Challenge, flagUP|flagUV)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("fremde Sitzung beendet die Zeremonie: %d, erwartet 400", rec.Code)
 	}
 }
 

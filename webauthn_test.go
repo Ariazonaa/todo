@@ -155,13 +155,35 @@ func TestCeremonyUsedListIsBounded(t *testing.T) {
 	s := ceremonyServer()
 	for i := range maxUsedCeremonies + 100 {
 		rec := startTestCeremony(t, s, "login", fmt.Sprint(i))
-		s.cer.consume(s.takeCeremony(httptest.NewRecorder(), withCeremonyCookie(rec), "login"))
+		if tk := s.takeCeremony(httptest.NewRecorder(), withCeremonyCookie(rec), "login"); tk != nil {
+			s.cer.consume(tk)
+		}
 	}
 	s.cer.mu.Lock()
 	n := len(s.cer.used)
 	s.cer.mu.Unlock()
 	if n > maxUsedCeremonies {
 		t.Fatalf("%d eingelöste Zeremonien gemerkt, Limit %d", n, maxUsedCeremonies)
+	}
+}
+
+// If real redemptions push a still-valid ceremony out of the list, the list
+// no longer knows it was used — a captured cookie + response could be
+// replayed. Everything expiring up to the evicted one is refused instead.
+func TestCeremonyReplayRefusedAfterEviction(t *testing.T) {
+	s := ceremonyServer()
+	captured := startTestCeremony(t, s, "login", "abgefangen")
+	if !s.cer.consume(s.takeCeremony(httptest.NewRecorder(), withCeremonyCookie(captured), "login")) {
+		t.Fatal("erstes Einlösen muss klappen")
+	}
+	for i := range maxUsedCeremonies {
+		rec := startTestCeremony(t, s, "login", fmt.Sprint(i))
+		if tk := s.takeCeremony(httptest.NewRecorder(), withCeremonyCookie(rec), "login"); tk != nil {
+			s.cer.consume(tk)
+		}
+	}
+	if tk := s.takeCeremony(httptest.NewRecorder(), withCeremonyCookie(captured), "login"); tk != nil && s.cer.consume(tk) {
+		t.Fatal("verdrängte, noch gültige Zeremonie ließ sich ein zweites Mal einlösen")
 	}
 }
 

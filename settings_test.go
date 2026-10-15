@@ -118,3 +118,10 @@ func TestNoteLangWritesOnlyOnChange(t *testing.T) {
 		t.Fatal("Wechsel nicht geschrieben")
 	}
 }
+
+// "Local" loads, but would mean the server's zone, not the user's.
+func TestValidateSettingsRejectsLocalTZ(t *testing.T) {
+	if validateSettings(appSettings{TZ: "Local", DigestTime: "09:00", ArchiveDays: 30}) == nil {
+		t.Fatal(`expected error for TZ "Local"`)
+	}
+}

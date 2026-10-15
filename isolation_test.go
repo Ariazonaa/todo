@@ -67,6 +67,7 @@ func TestIsolation(t *testing.T) {
 		{"Liste umbenennen", s.handleRenameList, "PUT", `{"name":"x"}`, []string{"id", list}},
 		{"Liste löschen", s.handleDeleteList, "DELETE", "", []string{"id", list}},
 		{"Liste teilen", s.handleAddMember, "PUT", "", []string{"id", list, "uid", fmt.Sprint(b)}},
+		{"ohne Einladung annehmen", s.handleAcceptInvite, "POST", "", []string{"id", list}},
 		{"Mitglied entfernen", s.handleRemoveMember, "DELETE", "", []string{"id", list, "uid", fmt.Sprint(a)}},
 		{"Unteraufgabe unter fremde", s.handleCreateTask, "POST", fmt.Sprintf(`{"title":"x","parent_id":%d}`, task.ID), nil},
 		{"in fremde Liste", s.handleCreateTask, "POST", fmt.Sprintf(`{"title":"x","list_id":%d}`, arbeit.ID), nil},
@@ -116,6 +117,7 @@ func TestIsolationCoversAllRoutes(t *testing.T) {
 		"handleSetupMode": true, "handleLocale": true, "handlePushKey": true,
 		// own session / own account by construction (tests in users_test.go)
 		"handleLogout": true, "handleLogoutAll": true, "handleEvents": true,
+		"handleFreshCheck": true, "handleReauthBegin": true, "handleReauthFinish": true,
 		"handleGetSettings": true, "handlePutSettings": true, "handleSetLanguage": true, "handleTestWebhook": true,
 		"handlePasskeyList": true, "handlePasskeyBegin": true, "handlePasskeyFinish": true, "handlePasskeyDelete": true,
 		"handlePushSubscribe": true, "handlePushUnsubscribe": true, "handlePushTest": true,

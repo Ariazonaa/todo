@@ -88,6 +88,32 @@ func TestSavePushSubUpserts(t *testing.T) {
 	}
 }
 
+// Knowing someone's endpoint is not enough to move their device to one's own
+// account (they'd get nothing anymore) — that takes the device's keys,
+// which only its browser has.
+func TestPushEndpointTakeoverNeedsTheKeys(t *testing.T) {
+	s := testServer(t)
+	b := mustUser(t, s, "Bea")
+	ep := "https://fcm.googleapis.com/fcm/send/abc"
+	savePushSub(s.db, ep, []byte{1}, []byte{2}, "o", 0, testUID)
+	if err := savePushSub(s.db, ep, []byte{9}, []byte{9}, "o", 0, b); !errors.Is(err, errPushTaken) {
+		t.Fatalf("fremde Schlüssel: %v, erwartet errPushTaken", err)
+	}
+	if sub, err := getPushSub(s.db, testUID, ep); err != nil || sub.P256dh[0] != 1 {
+		t.Fatalf("Gerät verändert: %+v %v", sub, err)
+	}
+	key, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"endpoint":%q,"keys":{"p256dh":%q,"auth":%q}}`, ep, b64.EncodeToString(key.PublicKey().Bytes()), b64.EncodeToString(make([]byte, 16)))
+	rec := httptest.NewRecorder()
+	s.handlePushSubscribe(rec, freshUser(httptest.NewRequest(http.MethodPut, "/", strings.NewReader(body)), b))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("Übernahme per Route: %d %s, erwartet 409", rec.Code, rec.Body)
+	}
+}
+
 func TestDeletePushSubsOfCredential(t *testing.T) {
 	db := testServer(t).db
 	savePushSub(db, "https://fcm.googleapis.com/a", []byte{1}, []byte{1}, "o", 1, testUID)
@@ -186,13 +212,11 @@ func TestExportImportKeepsPushState(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
 		t.Fatal(err)
 	}
-	if got := data.Tasks[0].PushRemindedAt; got == nil || *got != "p" {
+	if got := data.Tasks[0].PushRemindedAt.v; got == nil || *got != "p" {
 		t.Fatalf("Export push_reminded_at = %v", got)
 	}
 	// Backup from before web push: field missing → adopt Discord's state
-	rec = postImport(t, s, exportData{Tasks: []exportTask{
-		{ID: 1, Title: "alt", CreatedAt: "z", DueDate: ptr("2026-05-01"), DueTime: ptr("08:00"), RemindedAt: ptr("d")},
-	}})
+	rec = postImportRaw(t, s, testUID, `{"tasks":[{"id":1,"title":"alt","created_at":"z","due_date":"2026-05-01","due_time":"08:00","reminded_at":"d"}]}`)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("Import: %d %s", rec.Code, rec.Body)
 	}
@@ -200,6 +224,15 @@ func TestExportImportKeepsPushState(t *testing.T) {
 	s.db.QueryRow("SELECT id FROM tasks WHERE title = 'alt'").Scan(&id)
 	if v := column(t, s.db, "push_reminded_at", id); v.String != "d" {
 		t.Fatalf("Import ohne Feld: push_reminded_at = %v", v)
+	}
+	// Current backup, push never sent (null): must not count as pushed
+	rec = postImportRaw(t, s, testUID, `{"tasks":[{"id":1,"title":"neu","created_at":"z","due_date":"2026-05-01","due_time":"08:00","reminded_at":"d","push_reminded_at":null}]}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("Import: %d %s", rec.Code, rec.Body)
+	}
+	s.db.QueryRow("SELECT id FROM tasks WHERE title = 'neu'").Scan(&id)
+	if v := column(t, s.db, "push_reminded_at", id); v.Valid {
+		t.Fatalf("Import mit null: push_reminded_at = %v, Push wäre nie gekommen", v)
 	}
 }
 
@@ -396,8 +429,7 @@ func TestDeletingPasskeyRemovesItsPushDevices(t *testing.T) {
 	mustCreateSession(t, s.db, "frisch", time.Now().Add(sessionIdleTimeout), handy, testUID)
 	st.register(t, s.db, "/handy", handy)
 	st.register(t, s.db, "/laptop", laptop)
-	rec := httptest.NewRecorder()
-	s.handlePasskeyDelete(rec, passkeyReq(s, http.MethodDelete, "frisch", fmt.Sprint(laptop)))
+	rec := serveAuthed(s, s.handlePasskeyDelete, passkeyReq(s, http.MethodDelete, "frisch", fmt.Sprint(laptop)))
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("löschen: %d %s", rec.Code, rec.Body)
 	}

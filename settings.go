@@ -162,7 +162,8 @@ func validateSettings(s appSettings) error {
 			return uerr("error.webhook_discord")
 		}
 	}
-	if _, err := time.LoadLocation(s.TZ); err != nil || s.TZ == "" {
+	// "Local" would load too, but means whatever zone the server runs in.
+	if _, err := time.LoadLocation(s.TZ); err != nil || s.TZ == "" || s.TZ == "Local" {
 		return uerr("error.tz_unknown", "tz", s.TZ)
 	}
 	if _, err := time.Parse("15:04", s.DigestTime); err != nil {

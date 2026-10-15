@@ -65,6 +65,9 @@ func (s *scheduler) tick(now time.Time) {
 		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		s.logErr(fmt.Errorf("tick users: %w", err)) // the users read so far still get their reminders
+	}
 	for _, uid := range ids {
 		s.tickUser(uid, now)
 	}

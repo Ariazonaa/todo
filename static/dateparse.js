@@ -131,10 +131,26 @@ function parseNaturalDate(raw, lang = 'de', now = new Date()) {
           (m = re(/([0-3]?\d)\.([01]?\d)\.(\d{4})?/, DATE_POST))) {
         const d = Number(m[1]);
         const mo = Number(m[2]);
-        const y = m[3] ? Number(m[3]) : now.getFullYear();
-        let cand = new Date(y, mo - 1, d);
-        if (d >= 1 && mo >= 1 && mo <= 12 && cand.getDate() === d) {
-          if (!m[3] && localDateStr(cand) < todayStr) cand = new Date(y + 1, mo - 1, d);
+        // setFullYear instead of the constructor: that one turns years
+        // below 100 into 19xx. ok: the day exists in that year (no 31.4.,
+        // no 29.2. outside leap years — Date would roll those over).
+        const mk = (yy) => { const c = new Date(2000, mo - 1, d); c.setFullYear(yy); return c; };
+        const ok = (c, yy) => c.getFullYear() === yy && c.getMonth() === mo - 1 && c.getDate() === d;
+        let cand = null;
+        if (d >= 1 && mo >= 1 && mo <= 12) {
+          if (m[3]) {
+            const yy = Number(m[3]);
+            if (yy >= 1000 && ok(mk(yy), yy)) cand = mk(yy);
+          } else {
+            // Without a year: the next time the date comes around — for
+            // 29.2. that can be a few years ahead.
+            for (let yy = now.getFullYear(); yy <= now.getFullYear() + 8 && !cand; yy++) {
+              const c = mk(yy);
+              if (ok(c, yy) && localDateStr(c) >= todayStr) cand = c;
+            }
+          }
+        }
+        if (cand) {
           date = localDateStr(cand);
           strip(m);
         }

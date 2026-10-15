@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -30,6 +31,9 @@ const (
 	sessionRetireGrace = time.Minute
 	maxTitleLen        = 500
 	maxNoteLen         = 5000
+	// maxTasksPerOwner: tasks in one person's lists — as many as a backup
+	// may contain, so every export can be imported again.
+	maxTasksPerOwner = maxImportTasks
 )
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -68,7 +72,7 @@ func (s *server) requireAuth(next http.Handler) http.Handler {
 			writeError(w, r, http.StatusForbidden, "error.origin")
 			return
 		}
-		uid, ok := s.renewedAuth(w, r)
+		si, ok := s.authSession(w, r)
 		if !ok {
 			target := "/login"
 			if none, err := s.noPasskeys(); err == nil && none {
@@ -81,7 +85,11 @@ func (s *server) requireAuth(next http.Handler) http.Handler {
 			}
 			return
 		}
+		uid := si.uid
 		r = withUser(r, uid)
+		if !si.authAt.IsZero() {
+			r = withAuthAt(r, si.authAt)
+		}
 		if l := r.Header.Get("X-Lang"); l != "" {
 			s.store.noteLang(uid, strings.ToLower(strings.TrimSpace(l)))
 		}
@@ -102,22 +110,29 @@ func (s *server) sessionToken(r *http.Request) string {
 // renewedAuth checks the session, returns its user, and pushes its
 // expiration date forward while doing so.
 func (s *server) renewedAuth(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	si, ok := s.authSession(w, r)
+	return si.uid, ok
+}
+
+// authSession is renewedAuth with the whole session (including the time of
+// the passkey login).
+func (s *server) authSession(w http.ResponseWriter, r *http.Request) (sessionInfo, bool) {
 	token := s.sessionToken(r)
-	uid, expires, ok := sessionUser(s.db, token)
+	si, ok := sessionLookup(s.db, token)
 	if !ok {
-		return 0, false
+		return si, false
 	}
 	// Only renew once less than half the lifetime is left: otherwise every
 	// request would write to the single DB connection. And no longer once
 	// within the grace period of a replaced session (sessionRetireGrace).
-	if left := time.Until(expires); left > sessionIdleTimeout/2 || left <= sessionRetireGrace {
-		return uid, true
+	if left := time.Until(si.expires); left > sessionIdleTimeout/2 || left <= sessionRetireGrace {
+		return si, true
 	}
 	if err := renewSession(s.db, token, time.Now().Add(sessionIdleTimeout)); err != nil {
-		return uid, true // renewing is a convenience, not a reason to reject
+		return si, true // renewing is a convenience, not a reason to reject
 	}
 	s.setSessionCookie(w, token)
-	return uid, true
+	return si, true
 }
 
 func randomToken() (string, error) {
@@ -253,12 +268,21 @@ func (s *server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid := userID(r)
+	admin := userIsAdmin(s.db, uid)
+	// The webhook decides where task titles go — even after "sign out
+	// everywhere"; the archive period decides when everyone's completed
+	// tasks get deleted. Changing either needs a fresh login, like passkeys.
+	webhookChanged := req.WebhookURL != s.store.get(uid).WebhookURL
+	archiveChanged := admin && req.ArchiveDays != s.store.archiveDays()
+	if (webhookChanged || archiveChanged) && !s.requireFreshAuth(w, r) {
+		return
+	}
 	if err := s.store.save(uid, req); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
 	// The archive retention period applies to the whole instance: only the admin sets it.
-	if userIsAdmin(s.db, uid) {
+	if admin {
 		if err := s.store.saveArchiveDays(req.ArchiveDays); err != nil {
 			writeErr(w, r, http.StatusBadRequest, err)
 			return
@@ -311,10 +335,16 @@ func (s *server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
+	invites, err := invitesOf(s.db, uid)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"tasks": tasks,
-		"today": now.Format(dateFmt),
-		"lists": lists,
+		"tasks":   tasks,
+		"today":   now.Format(dateFmt),
+		"lists":   lists,
+		"invites": invites,
 	})
 }
 
@@ -341,7 +371,8 @@ type taskReq struct {
 // the two must not get mixed up, or the app would report "task with
 // subtasks ..." instead of an error on a DB outage.
 func (s *server) validateTaskReq(req *taskReq, uid, selfID int64) (dueDate, dueTime *string, errKey string, err error) {
-	req.Title = strings.TrimSpace(req.Title)
+	req.Title = strings.TrimSpace(cleanTitle(req.Title))
+	req.Note = cleanNote(req.Note)
 	if req.Title == "" {
 		return nil, nil, "error.title_missing", nil
 	}
@@ -352,7 +383,7 @@ func (s *server) validateTaskReq(req *taskReq, uid, selfID int64) (dueDate, dueT
 		return nil, nil, "error.note_too_long", nil
 	}
 	if req.DueDate != "" {
-		if _, err := time.Parse(dateFmt, req.DueDate); err != nil {
+		if !dueDateOK(req.DueDate) {
 			return nil, nil, "error.date_invalid", nil
 		}
 		dueDate = &req.DueDate
@@ -435,6 +466,10 @@ func (s *server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, err := createTask(s.db, uid, req.Title, dueDate, dueTime, req.Recurrence, req.Note, req.Pinned, derefInt(req.Priority), req.ListID, req.ParentID)
+	if errors.Is(err, errTaskLimit) {
+		writeError(w, r, http.StatusConflict, "error.task_limit", "n", maxTasksPerOwner)
+		return
+	}
 	if errors.Is(err, errListInvalid) {
 		writeError(w, r, http.StatusBadRequest, "error.list_not_found")
 		return
@@ -447,9 +482,10 @@ func (s *server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
+	// The task exists by now: a 500 here would make the client retry and
+	// create it twice.
 	if err := s.reopenParentOf(uid, t.ParentID); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
+		log.Printf("create task: reopen parent: %v", err)
 	}
 	s.changed(userID(r))
 	s.respondTask(w, userID(r), http.StatusCreated, t)
@@ -466,6 +502,54 @@ func derefInt(p *int) int {
 	return *p
 }
 
+// mergeTaskReq: an update only changes the fields it sends — everything else
+// keeps the current value. Otherwise an edit sheet that was open for a while
+// would write back what another device (a member of a shared list, the
+// "Done" button of a notification) changed in the meantime. null counts as
+// sent (clears the field). priority and list_id already mean "unchanged"
+// when absent.
+func mergeTaskReq(req *taskReq, present map[string]json.RawMessage, t Task) {
+	has := func(key string) bool {
+		for k := range present {
+			// encoding/json matches field names case-insensitively, so must we
+			if strings.EqualFold(k, key) {
+				return true
+			}
+		}
+		return false
+	}
+	deref := func(p *string) string {
+		if p == nil {
+			return ""
+		}
+		return *p
+	}
+	if !has("title") {
+		req.Title = t.Title
+	}
+	if !has("note") {
+		req.Note = t.Note
+	}
+	if !has("due_date") {
+		req.DueDate = deref(t.DueDate)
+	}
+	if !has("due_time") {
+		req.DueTime = deref(t.DueTime)
+	}
+	if !has("recurrence") {
+		req.Recurrence = t.Recurrence
+	}
+	if !has("pinned") {
+		req.Pinned = t.Pinned
+	}
+	if !has("in_progress") {
+		req.InProgress = t.InProgress
+	}
+	if !has("parent_id") {
+		req.ParentID = t.ParentID
+	}
+}
+
 // ptrEq: both nil, or both set with the same value.
 func ptrEq[T comparable](a, b *T) bool {
 	if a == nil || b == nil {
@@ -479,22 +563,100 @@ func (s *server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 65536)
-	var req taskReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 65536))
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "error.bad_request")
+		return
+	}
+	var sent taskReq
+	var present map[string]json.RawMessage
+	if json.Unmarshal(body, &sent) != nil || json.Unmarshal(body, &present) != nil {
 		writeError(w, r, http.StatusBadRequest, "error.bad_request")
 		return
 	}
 	uid := userID(r)
-	dueDate, dueTime, msg, err := s.validateTaskReq(&req, uid, t.ID)
+	// The fields not sent come from t. If another request changes the task
+	// before the write, the UPDATE's guard finds nothing to change; then t is
+	// read again and merged anew — a concurrent change is never written back
+	// over.
+	for attempt := 1; ; attempt++ {
+		req := sent
+		mergeTaskReq(&req, present, t)
+		dueDate, dueTime, msg, err := s.validateTaskReq(&req, uid, t.ID)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "error.internal")
+			return
+		}
+		if msg != "" {
+			writeError(w, r, http.StatusBadRequest, msg)
+			return
+		}
+		n, err := s.writeTaskUpdate(uid, t, req, dueDate, dueTime)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "error.internal")
+			return
+		}
+		if n == 1 {
+			break
+		}
+		cur, err := taskFor(s.db, uid, t.ID)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, r, http.StatusNotFound, "error.task_not_found")
+			return
+		}
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "error.internal")
+			return
+		}
+		if !sameTaskFields(cur, t) {
+			if attempt < 3 {
+				t = cur
+				continue
+			}
+			writeError(w, r, http.StatusConflict, "error.task_changed")
+			return
+		}
+		if req.ListID != nil && req.ParentID == nil && !listVisible(s.db, uid, *req.ListID) {
+			writeError(w, r, http.StatusBadRequest, "error.list_not_found")
+			return
+		}
+		if key, n := s.moveLimitHit(t, req); key != "" {
+			writeError(w, r, http.StatusConflict, key, "n", n)
+			return
+		}
+		writeError(w, r, http.StatusConflict, msgParentChanged)
+		return
+	}
+	t, err = taskFor(s.db, uid, t.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, r, http.StatusNotFound, "error.task_not_found")
+		return
+	}
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
-	if msg != "" {
-		writeError(w, r, http.StatusBadRequest, msg)
-		return
+	if !t.Done {
+		if err := s.reopenParentOf(uid, t.ParentID); err != nil {
+			writeError(w, r, http.StatusInternalServerError, "error.internal")
+			return
+		}
 	}
+	s.changed(userID(r))
+	s.respondTask(w, userID(r), http.StatusOK, t)
+}
+
+// sameTaskFields: the fields an update writes are the same in a and b.
+func sameTaskFields(a, b Task) bool {
+	return a.Title == b.Title && a.Note == b.Note && ptrEq(a.DueDate, b.DueDate) && ptrEq(a.DueTime, b.DueTime) &&
+		a.Recurrence == b.Recurrence && a.Pinned == b.Pinned && a.InProgress == b.InProgress &&
+		a.Priority == b.Priority && a.ListID == b.ListID && ptrEq(a.ParentID, b.ParentID)
+}
+
+// writeTaskUpdate writes the merged req over t in one transaction: the task,
+// its subtasks' list, its reminder stamps. 0 rows: a rule in the statement
+// didn't hold, or the row no longer holds what t says.
+func (s *server) writeTaskUpdate(uid int64, t Task, req taskReq, dueDate, dueTime *string) (int64, error) {
 	q := "UPDATE tasks SET title = ?, due_date = ?, due_time = ?, recurrence = ?, note = ?, pinned = ?, in_progress = ?, priority = COALESCE(?, priority), " +
 		// Subtasks follow their parent task's list; without list_id the list stays unchanged.
 		"list_id = CASE WHEN ? IS NOT NULL THEN (SELECT p.list_id FROM tasks p WHERE p.id = ?) ELSE COALESCE(?, list_id) END, " +
@@ -508,11 +670,16 @@ func (s *server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	// list, same as on creation — the old position came from a different set
 	// of siblings.
 	if !ptrEq(t.ParentID, req.ParentID) {
-		q += ", sort_order = (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM tasks WHERE parent_id IS ? AND id != ?)"
-		args = append(args, req.ParentID, t.ID)
+		q += ", sort_order = (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM tasks WHERE parent_id IS ? AND id != ? AND list_id " + visibleLists + ")"
+		args = append(args, req.ParentID, t.ID, uid)
 	}
 	q += " WHERE id = ? AND list_id " + visibleLists
 	args = append(args, t.ID, uid)
+	// The row must still hold what the fields not sent were taken from.
+	q += " AND title IS ? AND note IS ? AND due_date IS ? AND due_time IS ? AND recurrence IS ? AND pinned = ? AND in_progress = ? " +
+		"AND priority = ? AND list_id IS ? AND parent_id IS ?"
+	args = append(args, t.Title, t.Note, t.DueDate, t.DueTime, t.Recurrence, boolInt(t.Pinned), boolInt(t.InProgress),
+		t.Priority, t.ListID, t.ParentID)
 	if req.ListID != nil && req.ParentID == nil {
 		// Check the list within the write itself: a second device may have just
 		// deleted it.
@@ -526,56 +693,92 @@ func (s *server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		q += " AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND parent_id IS NULL AND list_id " + visibleLists + ") AND NOT EXISTS (SELECT 1 FROM tasks WHERE parent_id = ?)"
 		args = append(args, *req.ParentID, uid, t.ID)
 	}
+	if movesList(t, req) {
+		ml := newMoveLimits(req)
+		q += " AND (" + ml.same + " OR (" + ml.tasks + " AND " + ml.storage + "))"
+		args = append(append(append(args, ml.sameArgs...), ml.tasksArgs...), ml.storageArgs...)
+	}
 	// A task and its subtasks change list together.
 	tx, err := s.db.Begin()
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
+		return 0, err
 	}
 	defer tx.Rollback()
 	res, err := tx.Exec(q, args...)
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
+		return 0, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		tx.Rollback() // single connection: release first, then look it up via s.db
-		if _, err := taskFor(s.db, uid, t.ID); errors.Is(err, sql.ErrNoRows) {
-			writeError(w, r, http.StatusNotFound, "error.task_not_found")
-		} else if req.ListID != nil && req.ParentID == nil && !listVisible(s.db, uid, *req.ListID) {
-			writeError(w, r, http.StatusBadRequest, "error.list_not_found")
-		} else {
-			writeError(w, r, http.StatusConflict, msgParentChanged)
-		}
-		return
+		return 0, nil
 	}
 	if _, err := tx.Exec("UPDATE tasks SET list_id = (SELECT list_id FROM tasks WHERE id = ?) WHERE parent_id = ?", t.ID, t.ID); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
+		return 0, err
 	}
 	if dueChanged {
 		if err := clearReminders(tx, t.ID); err != nil {
-			writeError(w, r, http.StatusInternalServerError, "error.internal")
-			return
+			return 0, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
+	return 1, tx.Commit()
+}
+
+// movesList: the update can put the task into another list.
+func movesList(t Task, req taskReq) bool {
+	if req.ParentID != nil {
+		return !ptrEq(t.ParentID, req.ParentID)
 	}
-	t, err = getTask(s.db, t.ID)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
+	return req.ListID != nil && *req.ListID != t.ListID
+}
+
+// moveLimits: SQL conditions for the task UPDATE. A task moving into another
+// owner's lists takes itself, its subtasks and their images along — the new
+// owner must stay within maxTasksPerOwner and maxAttachmentBytesPerOwner,
+// otherwise members could unload any amount onto them (and their backup no
+// longer fit back in). Moves within one owner's lists are always fine.
+type moveLimits struct {
+	same, tasks, storage             string
+	sameArgs, tasksArgs, storageArgs []any
+}
+
+func newMoveLimits(req taskReq) moveLimits {
+	// The target list as the UPDATE sets it (tasks = the row being updated).
+	const target = "CASE WHEN ? IS NOT NULL THEN (SELECT p.list_id FROM tasks p WHERE p.id = ?) ELSE COALESCE(?, tasks.list_id) END"
+	const owner = "(SELECT owner_id FROM lists WHERE id = " + target + ")"
+	const ownerTasks = "(SELECT o.id FROM tasks o WHERE o.list_id IN (SELECT id FROM lists WHERE owner_id = " + owner + "))"
+	const family = "(SELECT f.id FROM tasks f WHERE f.id = tasks.id OR f.parent_id = tasks.id)"
+	ta := []any{req.ParentID, req.ParentID, req.ListID}
+	return moveLimits{
+		same:     "(" + owner + " IS (SELECT owner_id FROM lists WHERE id = tasks.list_id))",
+		sameArgs: ta,
+		tasks: "((SELECT COUNT(*) FROM tasks c WHERE c.id IN " + ownerTasks + ") + " +
+			"(SELECT COUNT(*) FROM tasks c WHERE c.id IN " + family + ") <= ?)",
+		tasksArgs: append(append([]any{}, ta...), maxTasksPerOwner),
+		storage: "((SELECT COALESCE(SUM(length(a.data)), 0) FROM attachments a WHERE a.task_id IN " + ownerTasks + ") + " +
+			"(SELECT COALESCE(SUM(length(a.data)), 0) FROM attachments a WHERE a.task_id IN " + family + ") <= ?)",
+		storageArgs: append(append([]any{}, ta...), maxAttachmentBytesPerOwner),
 	}
-	if !t.Done {
-		if err := s.reopenParentOf(uid, t.ParentID); err != nil {
-			writeError(w, r, http.StatusInternalServerError, "error.internal")
-			return
-		}
+}
+
+// moveLimitHit: after an update came back empty — was it the target owner's
+// task or image limit? Returns the catalog key and the limit for it.
+func (s *server) moveLimitHit(t Task, req taskReq) (string, any) {
+	if !movesList(t, req) {
+		return "", nil
 	}
-	s.changed(userID(r))
-	s.respondTask(w, userID(r), http.StatusOK, t)
+	ml := newMoveLimits(req)
+	args := append(append(append(append(append([]any{}, ml.sameArgs...), ml.tasksArgs...), ml.sameArgs...), ml.storageArgs...), t.ID)
+	var tasksOK, storageOK bool
+	if err := s.db.QueryRow("SELECT "+ml.same+" OR "+ml.tasks+", "+ml.same+" OR "+ml.storage+" FROM tasks WHERE id = ?", args...).
+		Scan(&tasksOK, &storageOK); err != nil {
+		return "", nil
+	}
+	switch {
+	case !tasksOK:
+		return "error.task_limit", maxTasksPerOwner
+	case !storageOK:
+		return "error.storage_limit", maxAttachmentBytesPerOwner >> 20
+	}
+	return "", nil
 }
 
 func (s *server) handleSnoozeTask(w http.ResponseWriter, r *http.Request) {
@@ -606,62 +809,98 @@ func (s *server) handleSnoozeTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	today := s.nowFor(userID(r)).Format(dateFmt)
-	base := today
-	if t.DueDate != nil && *t.DueDate > today {
-		base = *t.DueDate
-	}
-	bt, err := time.Parse(dateFmt, base)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
-	newDate := bt.AddDate(0, 0, req.Days).Format(dateFmt)
-	// Reopen and snooze together or not at all: doing them separately could
-	// leave a reopened but unsnoozed task behind on error.
-	tx, err := s.db.Begin()
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
-	defer tx.Rollback()
-	// A completed task becomes open again after snoozing — so also roll back
-	// the daily counter, or the next completion would count it twice.
 	uid := userID(r)
-	if err := s.reopenDone(tx, uid, t); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
-	// Snoozing means "I'll do it later" -> out of "in progress". The
-	// expected_due_date check is additionally placed here in the WHERE clause
-	// (not just in the check above): otherwise a concurrent request could
-	// interfere (rules belong in the write statement itself).
-	res, err := tx.Exec("UPDATE tasks SET due_date = ?, in_progress = 0 WHERE id = ? AND list_id "+visibleLists+" AND (? = '' OR due_date IS ?)",
-		newDate, t.ID, uid, req.ExpectedDueDate, req.ExpectedDueDate)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
-	if n, _ := res.RowsAffected(); n != 1 && req.ExpectedDueDate != "" {
-		writeError(w, r, http.StatusConflict, "error.task_changed")
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
+	for attempt := 1; ; attempt++ {
+		err := s.snoozeOnce(uid, t, req.Days, req.ExpectedDueDate)
+		if errors.Is(err, errStaleCompletion) && attempt < 3 {
+			// completed again by someone else meanwhile: reread and redo
+			if t, err = taskFor(s.db, uid, t.ID); errors.Is(err, sql.ErrNoRows) {
+				writeError(w, r, http.StatusNotFound, "error.task_not_found")
+				return
+			} else if err != nil {
+				writeError(w, r, http.StatusInternalServerError, "error.internal")
+				return
+			}
+			continue
+		}
+		// Still completed by someone else after the retries: the snooze
+		// didn't happen, don't answer as if it had.
+		if errors.Is(err, errTaskChanged) || errors.Is(err, errStaleCompletion) {
+			writeError(w, r, http.StatusConflict, "error.task_changed")
+			return
+		}
+		if errors.Is(err, errDateRange) {
+			writeError(w, r, http.StatusBadRequest, "error.date_invalid")
+			return
+		}
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "error.internal")
+			return
+		}
+		break
 	}
 	// After the commit: reopenParentOf goes through s.db (single connection).
 	if err := s.reopenParentOf(uid, t.ParentID); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
-	t, err = getTask(s.db, t.ID)
+	t, err := taskFor(s.db, uid, t.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, r, http.StatusNotFound, "error.task_not_found")
+		return
+	}
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
 	s.changed(userID(r))
 	s.respondTask(w, userID(r), http.StatusOK, t)
+}
+
+// errTaskChanged: the due date no longer matches expected_due_date.
+var errTaskChanged = errors.New("task changed")
+
+// snoozeOnce moves t's due date by days (from today, or from a due date in
+// the future) and reopens it if it was done — together or not at all.
+func (s *server) snoozeOnce(uid int64, t Task, days int, expected string) error {
+	today := s.nowFor(uid).Format(dateFmt)
+	base := today
+	if t.DueDate != nil && *t.DueDate > today {
+		base = *t.DueDate
+	}
+	bt, err := time.Parse(dateFmt, base)
+	if err != nil {
+		return err
+	}
+	newDate := bt.AddDate(0, 0, days).Format(dateFmt)
+	if newDate > maxDueDate {
+		return errDateRange
+	}
+	// Before the transaction: reopenStat may read settings through s.db.
+	statUID, statDate := s.reopenStat(uid, t)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// A completed task becomes open again after snoozing — so also roll back
+	// the daily counter, or the next completion would count it twice.
+	if err := reopenDone(tx, uid, t, statUID, statDate); err != nil {
+		return err
+	}
+	// Snoozing means "I'll do it later" -> out of "in progress". The
+	// expected_due_date check is additionally placed here in the WHERE clause
+	// (not just in the check above): otherwise a concurrent request could
+	// interfere (rules belong in the write statement itself).
+	res, err := tx.Exec("UPDATE tasks SET due_date = ?, in_progress = 0 WHERE id = ? AND list_id "+visibleLists+" AND (? = '' OR due_date IS ?)",
+		newDate, t.ID, uid, expected, expected)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 && expected != "" {
+		return errTaskChanged
+	}
+	return tx.Commit()
 }
 
 func (s *server) handleAddLink(w http.ResponseWriter, r *http.Request) {
@@ -684,7 +923,10 @@ func (s *server) handleAddLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
-	if err := linkTasks(s.db, userID(r), t.ID, req.Other); err != nil {
+	if err := linkTasks(s.db, userID(r), t.ID, req.Other); errors.Is(err, errLinkLimit) {
+		writeError(w, r, http.StatusConflict, "error.link_limit", "n", maxLinksPerTask)
+		return
+	} else if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
@@ -728,17 +970,12 @@ func (s *server) handleToggleProgress(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "error.sub_progress")
 		return
 	}
-	if _, err := s.db.Exec("UPDATE tasks SET in_progress = ? WHERE id = ? AND list_id "+visibleLists, boolInt(req.On), t.ID, userID(r)); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
-	t, err := getTask(s.db, t.ID)
-	if err != nil {
+	if _, err := s.db.Exec("UPDATE tasks SET in_progress = ? WHERE id = ? AND parent_id IS NULL AND list_id "+visibleLists, boolInt(req.On), t.ID, userID(r)); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
 	s.changed(userID(r))
-	s.respondTask(w, userID(r), http.StatusOK, t)
+	s.respondCurrent(w, r, t.ID, http.StatusOK)
 }
 
 // handleReorder sets the manual ordering: the client sends the IDs of a list
@@ -891,10 +1128,14 @@ func (s *server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 				writeError(w, r, http.StatusInternalServerError, "error.internal")
 				return
 			}
+			if next > maxDueDate {
+				writeError(w, r, http.StatusBadRequest, "error.date_invalid")
+				return
+			}
 			// The new due date has no reminder stamp, so it will fire again. The
 			// due_date in the WHERE clause catches concurrent requests (0 rows =
 			// already advanced).
-			res, err := s.db.Exec("UPDATE tasks SET due_date = ?, in_progress = 0 WHERE id = ? AND list_id "+visibleLists+" AND done = 0 AND due_date = ?", next, t.ID, uid, *t.DueDate)
+			res, err := s.db.Exec("UPDATE tasks SET due_date = ?, in_progress = 0 WHERE id = ? AND list_id "+visibleLists+" AND done = 0 AND due_date = ? AND recurrence = ?", next, t.ID, uid, *t.DueDate, t.Recurrence)
 			if err != nil {
 				writeError(w, r, http.StatusInternalServerError, "error.internal")
 				return
@@ -908,7 +1149,7 @@ func (s *server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 				// old date they'd be immediately due again (ping) and overdue every
 				// day starting tomorrow (digest).
 				shift := fmt.Sprintf("%+d days", daysBetween(*t.DueDate, next))
-				if _, err := s.db.Exec("UPDATE tasks SET done = 0, completed_at = NULL, "+
+				if _, err := s.db.Exec("UPDATE tasks SET done = 0, completed_at = NULL, completed_by = NULL, "+
 					"due_date = CASE WHEN due_date IS NULL THEN NULL ELSE date(due_date, ?) END WHERE parent_id = ? AND list_id "+visibleLists, shift, t.ID, uid); err != nil {
 					log.Printf("recurrence: subtasks of %d: %v", t.ID, err)
 				}
@@ -931,9 +1172,11 @@ func (s *server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 		}
 		completed := time.Now().UTC().Format(time.RFC3339)
 		// Check additionally placed in the WHERE clause: closes the gap between
-		// reading (above) and writing against a concurrent request.
-		res, err := s.db.Exec("UPDATE tasks SET done = 1, completed_at = ?, in_progress = 0 WHERE id = ? AND list_id "+visibleLists+" AND done = 0 AND (? = '' OR due_date IS ?)",
-			completed, t.ID, uid, req.ExpectedDueDate, req.ExpectedDueDate)
+		// reading (above) and writing against a concurrent request — also one
+		// that just made the task recurring (those are never done = 1).
+		res, err := s.db.Exec("UPDATE tasks SET done = 1, completed_at = ?, completed_by = ?, in_progress = 0 WHERE id = ? AND list_id "+visibleLists+" AND done = 0 AND (? = '' OR due_date IS ?) "+
+			"AND (recurrence = '' OR due_date IS NULL)",
+			completed, uid, t.ID, uid, req.ExpectedDueDate, req.ExpectedDueDate)
 		if err != nil {
 			writeError(w, r, http.StatusInternalServerError, "error.internal")
 			return
@@ -948,7 +1191,7 @@ func (s *server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Completing the parent also completes its open subtasks (the client asks first)
-		if res2, err := s.db.Exec("UPDATE tasks SET done = 1, completed_at = ? WHERE parent_id = ? AND list_id "+visibleLists+" AND done = 0", completed, t.ID, uid); err == nil {
+		if res2, err := s.db.Exec("UPDATE tasks SET done = 1, completed_at = ?, completed_by = ? WHERE parent_id = ? AND list_id "+visibleLists+" AND done = 0", completed, uid, t.ID, uid); err == nil {
 			if n2, _ := res2.RowsAffected(); n2 > 0 {
 				if err := bumpStat(s.db, uid, today, int(n2)); err != nil {
 					log.Printf("stats: %v", err)
@@ -956,13 +1199,8 @@ func (s *server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	t, err := getTask(s.db, t.ID)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
 	s.changed(userID(r))
-	s.respondTask(w, userID(r), http.StatusOK, t)
+	s.respondCurrent(w, r, t.ID, http.StatusOK)
 }
 
 func (s *server) handleUncompleteTask(w http.ResponseWriter, r *http.Request) {
@@ -971,7 +1209,7 @@ func (s *server) handleUncompleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid := userID(r)
-	if err := s.reopenDone(s.db, uid, t); err != nil {
+	if err := s.reopen(uid, t); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
@@ -979,35 +1217,80 @@ func (s *server) handleUncompleteTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
-	t, err := getTask(s.db, t.ID)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
 	s.changed(userID(r))
-	s.respondTask(w, userID(r), http.StatusOK, t)
+	s.respondCurrent(w, r, t.ID, http.StatusOK)
 }
 
-// reopenDone reverts a completion, including the daily counter on the
-// original completion day. Only what the UPDATE actually reopened gets
-// booked — done = 1 in the WHERE clause catches duplicate requests. ex is
-// s.db or a transaction (in that case, nothing inside it via s.db — single
-// connection, deadlock).
-func (s *server) reopenDone(ex execer, uid int64, t Task) error {
-	res, err := ex.Exec("UPDATE tasks SET done = 0, completed_at = NULL WHERE id = ? AND list_id "+visibleLists+" AND done = 1", t.ID, uid)
+// reopenStat: whose daily counter a reopen of t takes back, and for which
+// day — the person who checked it off (in a shared list that's not
+// necessarily the one reopening it), on their completion day. statUID 0:
+// that account no longer exists, nobody's counter changes. Call outside a
+// transaction: it may read settings through s.db.
+func (s *server) reopenStat(uid int64, t Task) (statUID int64, date string) {
+	statUID = uid // legacy rows without completed_by: from before accounts
+	if t.CompletedBy != nil {
+		statUID = *t.CompletedBy
+	}
+	if statUID == 0 {
+		return 0, ""
+	}
+	loc := s.store.location(statUID)
+	date = time.Now().In(loc).Format(dateFmt)
+	if t.CompletedAt != nil {
+		if ct, err := time.Parse(time.RFC3339, *t.CompletedAt); err == nil {
+			date = ct.In(loc).Format(dateFmt)
+		}
+	}
+	return statUID, date
+}
+
+// errStaleCompletion: the task was completed again (by someone else) after
+// t was read — the stat would go back to the wrong person. Reread, retry.
+var errStaleCompletion = errors.New("completion changed")
+
+// reopenDone reverts a completion, including the daily counter from
+// reopenStat. Only what the UPDATE actually reopened gets booked — done = 1
+// in the WHERE clause catches duplicate requests, and the completion read
+// into t must still be the one in the row. ex is s.db or a transaction (in
+// that case, nothing inside it via s.db — single connection, deadlock).
+func reopenDone(ex dbtx, uid int64, t Task, statUID int64, statDate string) error {
+	res, err := ex.Exec("UPDATE tasks SET done = 0, completed_at = NULL, completed_by = NULL WHERE id = ? AND list_id "+visibleLists+
+		" AND done = 1 AND completed_at IS ? AND completed_by IS ?", t.ID, uid, t.CompletedAt, t.CompletedBy)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 1 {
-		date := s.nowFor(uid).Format(dateFmt)
-		if t.CompletedAt != nil {
-			if ct, err := time.Parse(time.RFC3339, *t.CompletedAt); err == nil {
-				date = ct.In(s.store.location(uid)).Format(dateFmt)
-			}
+		if statUID != 0 {
+			return bumpStat(ex, statUID, statDate, -1)
 		}
-		return bumpStat(ex, uid, date, -1)
+		return nil
+	}
+	var done bool
+	if err := ex.QueryRow("SELECT done = 1 FROM tasks WHERE id = ? AND list_id "+visibleLists, t.ID, uid).Scan(&done); err == nil && done {
+		return errStaleCompletion
 	}
 	return nil
+}
+
+// reopen is reopenDone outside a transaction, rereading t when it was
+// completed again in the meantime.
+func (s *server) reopen(uid int64, t Task) error {
+	for attempt := 1; ; attempt++ {
+		statUID, statDate := s.reopenStat(uid, t)
+		err := reopenDone(s.db, uid, t, statUID, statDate)
+		if !errors.Is(err, errStaleCompletion) {
+			return err
+		}
+		if attempt == 3 {
+			return nil // completed over and over by others: leave it done
+		}
+		if t, err = taskFor(s.db, uid, t.ID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+	}
 }
 
 // reopenParentOf: an open subtask under a completed parent task would only
@@ -1025,7 +1308,7 @@ func (s *server) reopenParentOf(uid int64, parentID *int64) error {
 	if err != nil {
 		return err
 	}
-	return s.reopenDone(s.db, uid, p)
+	return s.reopen(uid, p)
 }
 
 func (s *server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
@@ -1077,6 +1360,22 @@ func deleteFamily(db *sql.DB, family string, args ...any) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// respondCurrent answers with task id as the requesting person sees it now
+// — through taskFor, not getTask: between the write and this read the task
+// could have been deleted and its ID handed to someone else's new task.
+func (s *server) respondCurrent(w http.ResponseWriter, r *http.Request, id int64, code int) {
+	t, err := taskFor(s.db, userID(r), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, r, http.StatusNotFound, "error.task_not_found")
+		return
+	}
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	}
+	s.respondTask(w, userID(r), code, t)
 }
 
 func (s *server) respondTask(w http.ResponseWriter, uid int64, code int, t Task) {

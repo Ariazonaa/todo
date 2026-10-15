@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // call invokes a handler directly; pv are path values as pairs
@@ -25,7 +26,7 @@ func call(t *testing.T, h http.HandlerFunc, method, target string, body io.Reade
 // callAs invokes h as user uid (as after requireAuth).
 func callAs(t *testing.T, uid int64, h http.HandlerFunc, method, target string, body io.Reader, pv ...string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := withUser(httptest.NewRequest(method, target, body), uid)
+	req := freshUser(httptest.NewRequest(method, target, body), uid)
 	for i := 0; i+1 < len(pv); i += 2 {
 		req.SetPathValue(pv[i], pv[i+1])
 	}
@@ -360,8 +361,61 @@ func mustCreateAs(t *testing.T, s *server, uid int64, body string) Task {
 	return task
 }
 
+// An edit sheet that stays open for a while used to write back every field
+// on save — whatever another device changed in the meantime was lost. An
+// update now only changes the fields it sends.
+func TestUpdateOnlyChangesSentFields(t *testing.T) {
+	s := testServer(t)
+	task := mustCreate(t, s, `{"title":"Alt","note":"Notiz","due_date":"2026-03-01","due_time":"08:00","recurrence":"daily","priority":2}`)
+	id := fmt.Sprint(task.ID)
+	// Meanwhile another device: done via notification (date moves on), pinned
+	call(t, s.handleCompleteTask, "POST", "/", strings.NewReader(`{"expected_due_date":"2026-03-01"}`), "id", id)
+	call(t, s.handleUpdateTask, "PUT", "/", strings.NewReader(`{"pinned":true}`), "id", id)
+	moved, _ := getTask(s.db, task.ID)
+	if moved.DueDate == nil || *moved.DueDate == "2026-03-01" || !moved.Pinned {
+		t.Fatalf("Vorbereitung: %+v", moved)
+	}
+	// The sheet only changed the title
+	if rec := call(t, s.handleUpdateTask, "PUT", "/", strings.NewReader(`{"title":"Neu"}`), "id", id); rec.Code != http.StatusOK {
+		t.Fatalf("speichern: %d %s", rec.Code, rec.Body)
+	}
+	got, _ := getTask(s.db, task.ID)
+	if got.Title != "Neu" || got.Note != "Notiz" || *got.DueDate != *moved.DueDate || *got.DueTime != "08:00" ||
+		got.Recurrence != "daily" || !got.Pinned || got.Priority != 2 {
+		t.Fatalf("nicht gesendete Felder verändert: %+v", got)
+	}
+	// null clears a field
+	if rec := call(t, s.handleUpdateTask, "PUT", "/", strings.NewReader(`{"due_time":null,"note":""}`), "id", id); rec.Code != http.StatusOK {
+		t.Fatalf("leeren: %d %s", rec.Code, rec.Body)
+	}
+	if got, _ := getTask(s.db, task.ID); got.DueTime != nil || got.Note != "" || got.DueDate == nil {
+		t.Fatalf("leeren: %+v", got)
+	}
+	// Rules apply to the merged result: a time without a date stays invalid
+	call(t, s.handleUpdateTask, "PUT", "/", strings.NewReader(`{"recurrence":""}`), "id", id)
+	if code, _ := errorOf(t, s.handleUpdateTask, "en", "PUT", "/", `{"due_date":null}`, "id", id); code != http.StatusOK {
+		t.Fatalf("Datum leeren: %d", code)
+	}
+	if code, _ := errorOf(t, s.handleUpdateTask, "en", "PUT", "/", `{"due_time":"10:00"}`, "id", id); code != http.StatusBadRequest {
+		t.Fatalf("Uhrzeit ohne Datum: %d, erwartet 400", code)
+	}
+	// A subtask stays one when the update doesn't mention parent_id
+	sub := mustCreate(t, s, fmt.Sprintf(`{"title":"Teil","parent_id":%d}`, task.ID))
+	call(t, s.handleUpdateTask, "PUT", "/", strings.NewReader(`{"title":"Teil 2"}`), "id", fmt.Sprint(sub.ID))
+	if got, _ := getTask(s.db, sub.ID); got.ParentID == nil || *got.ParentID != task.ID || got.Title != "Teil 2" {
+		t.Fatalf("Unteraufgabe: %+v", got)
+	}
+}
+
 // asTestUser sets the test user on the request, the way requireAuth would —
 // for tests with a real HTTP server, without logging in.
 func asTestUser(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) { h(w, withUser(r, testUID)) }
+	return func(w http.ResponseWriter, r *http.Request) { h(w, freshUser(r, testUID)) }
+}
+
+// freshUser: a request as uid the way requireAuth passes it on, from a
+// session that signed in with a passkey just now (requireFreshAuth lets it
+// through). Tests of the stale case send a session cookie instead.
+func freshUser(r *http.Request, uid int64) *http.Request {
+	return withAuthAt(withUser(r, uid), time.Now())
 }

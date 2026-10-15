@@ -32,14 +32,24 @@ async function wanFetch(url, body, headers) {
 }
 
 async function passkeyLogin() {
-  const begin = await wanFetch('/api/auth/login/begin');
+  await passkeyAssert('/api/auth/login/begin', '/api/auth/login/finish');
+}
+
+// passkeyReauth confirms the current session with one of its own account's
+// passkeys (a full login would also accept someone else's on a shared device).
+async function passkeyReauth() {
+  await passkeyAssert('/api/auth/reauth/begin', '/api/auth/reauth/finish');
+}
+
+async function passkeyAssert(beginUrl, finishUrl) {
+  const begin = await wanFetch(beginUrl);
   const opt = (await begin.json()).publicKey;
   opt.challenge = b64uToBuf(opt.challenge);
   if (opt.allowCredentials) {
     opt.allowCredentials = opt.allowCredentials.map((c) => ({ ...c, id: b64uToBuf(c.id) }));
   }
   const cred = await navigator.credentials.get({ publicKey: opt });
-  await wanFetch('/api/auth/login/finish', {
+  await wanFetch(finishUrl, {
     id: cred.id,
     rawId: bufToB64u(cred.rawId),
     type: cred.type,

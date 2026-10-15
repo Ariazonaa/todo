@@ -74,7 +74,7 @@ func TestExportLargerThanOldLimitCanBeImported(t *testing.T) {
 
 	dst := fileServer(t)
 	rec := httptest.NewRecorder()
-	dst.handleImport(rec, withUser(httptest.NewRequest(http.MethodPost, "/api/import", counted), testUID))
+	dst.handleImport(rec, freshUser(httptest.NewRequest(http.MethodPost, "/api/import", counted), testUID))
 	io.Copy(io.Discard, pr) // don't leave the export hanging if the import aborts early
 
 	if exported <= 200<<20 {
@@ -107,16 +107,58 @@ func (c *countingReader) Read(b []byte) (int, error) {
 	return k, err
 }
 
-// A second import running while one is already in progress used to share
-// the staging table with the first.
+// A second import of the same person while one is already in progress used
+// to share the staging table with the first.
 func TestImportRejectsConcurrentImport(t *testing.T) {
 	s := testServer(t)
-	s.importMu.Lock()
-	defer s.importMu.Unlock()
+	if !userImports.acquire(testUID) {
+		t.Fatal("Import-Slot belegt")
+	}
+	defer userImports.release(testUID)
 	rec := httptest.NewRecorder()
-	s.handleImport(rec, withUser(httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader([]byte(`{"tasks":[]}`))), testUID))
+	s.handleImport(rec, freshUser(httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader([]byte(`{"tasks":[]}`))), testUID))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("Import während eines Imports: %d %s, erwartet 409", rec.Code, rec.Body)
+	}
+}
+
+// Someone else's running import (a slow upload) doesn't block one's own,
+// and each only touches its own staged images.
+func TestImportsOfDifferentPeopleRunSideBySide(t *testing.T) {
+	s := testServer(t)
+	bea := mustUser(t, s, "Bea")
+	if !userImports.acquire(bea) {
+		t.Fatal("Import-Slot belegt")
+	}
+	defer userImports.release(bea)
+	s.db.Exec("INSERT INTO import_attachments (user_id, task_id, mime, created_at, data) VALUES (?, 1, 'image/png', 'z', x'00')", bea)
+	body := `{"tasks":[{"id":1,"title":"t","created_at":"z"}],"attachments":[{"task_id":1,"mime":"image/png","created_at":"z","data":"eA=="}]}`
+	rec := httptest.NewRecorder()
+	s.handleImport(rec, freshUser(httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader([]byte(body))), testUID))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("Import neben fremdem Import: %d %s", rec.Code, rec.Body)
+	}
+	var mine, beas int
+	s.db.QueryRow("SELECT COUNT(*) FROM attachments a JOIN tasks t ON t.id = a.task_id WHERE t.list_id "+ownedLists, testUID).Scan(&mine)
+	s.db.QueryRow("SELECT COUNT(*) FROM import_attachments WHERE user_id = ?", bea).Scan(&beas)
+	if mine != 1 || beas != 1 {
+		t.Fatalf("eigene Bilder %d (erwartet 1), Beas Zwischenablage %d (erwartet 1)", mine, beas)
+	}
+}
+
+// An import replaces everything — with only a stale session (stolen cookie)
+// it's refused before the upload is even read.
+func TestImportNeedsFreshAuth(t *testing.T) {
+	s := testServer(t)
+	mustCreate(t, s, `{"title":"bleibt"}`)
+	rec := serveAuthed(s, s.handleImport, staleRequest(t, s, testUID, http.MethodPost, `{"tasks":[]}`))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("Import mit alter Sitzung: %d, erwartet 403", rec.Code)
+	}
+	var n int
+	s.db.QueryRow("SELECT COUNT(*) FROM tasks").Scan(&n)
+	if n != 1 {
+		t.Fatal("Bestand trotz 403 ersetzt")
 	}
 }
 
@@ -127,7 +169,7 @@ func TestImportAcceptsAttachmentsBeforeTasks(t *testing.T) {
 	body := `{"attachments":[{"task_id":1,"mime":"image/png","created_at":"z","data":"eA=="}],` +
 		`"tasks":[{"id":1,"title":"t","created_at":"z"}]}`
 	rec := httptest.NewRecorder()
-	s.handleImport(rec, withUser(httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader([]byte(body))), testUID))
+	s.handleImport(rec, freshUser(httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader([]byte(body))), testUID))
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("erwartet 204, bekam %d (%s)", rec.Code, rec.Body)
 	}
@@ -145,7 +187,7 @@ func TestImportFailureMidStreamKeepsOldData(t *testing.T) {
 	s.db.Exec("INSERT INTO tasks (id, title, created_at) VALUES (7, 'bleibt', 'z')")
 	body := `{"tasks":[{"id":1,"title":"neu","created_at":"z"}],"attachments":[{"task_id":1,"mime":"image/png","created_at":"z","data":"eA=="},{"task_id":1,`
 	rec := httptest.NewRecorder()
-	s.handleImport(rec, withUser(httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader([]byte(body))), testUID))
+	s.handleImport(rec, freshUser(httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader([]byte(body))), testUID))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("erwartet 400, bekam %d (%s)", rec.Code, rec.Body)
 	}
