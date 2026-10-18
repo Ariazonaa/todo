@@ -4,6 +4,14 @@ All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/); every release is also published as
 a Docker image `ghcr.io/ariazonaa/todo:X.Y.Z` (plus `:X.Y` and `:X`).
 
+## 1.1.1 — 2026-10-19
+
+### Fixed
+
+- iPhone (home screen app): after typing in the edit sheet, "Save" and
+  "Cancel" ignored taps. The sheet header no longer scrolls with the sheet;
+  only its content does.
+
 ## 1.1.0 — 2026-10-15
 
 ### Changed
