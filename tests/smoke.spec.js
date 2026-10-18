@@ -227,6 +227,34 @@ test('offenes Sheet hält die Seite dahinter fest', async () => {
   expect(await page.evaluate(() => getComputedStyle(document.body).position)).toBe('static');
 });
 
+// iOS (home screen app, keyboard open) hit-tested the sticky sheet header
+// somewhere other than where it painted it: "Save" and "Cancel" ignored every
+// tap. The keyboard can't be emulated, so pin the structure instead: the
+// dialog doesn't scroll, only its body does, and the header stays put.
+test('Sheet-Kopfzeile scrollt nicht mit und bleibt antippbar', async () => {
+  await page.click('#open-settings');
+  const sheet = page.locator('#settings');
+  await expect(sheet).toBeVisible();
+  // The open animation scales the sheet — measure only once it's done
+  await expect.poll(() => sheet.evaluate((d) => d.getAnimations().length)).toBe(0);
+  const kopfVorher = await sheet.locator('.sheet-head').boundingBox();
+  const inhalt = sheet.locator('.sheet-body');
+  // The settings sheet is longer than the viewport — the body must scroll
+  expect(await inhalt.evaluate((b) => b.scrollHeight > b.clientHeight)).toBe(true);
+  await inhalt.evaluate((b) => { b.scrollTop = b.scrollHeight; });
+  expect(await inhalt.evaluate((b) => b.scrollTop)).toBeGreaterThan(0);
+  expect(await sheet.evaluate((d) => d.scrollTop)).toBe(0);
+  expect(await sheet.evaluate((d) => getComputedStyle(d.querySelector('.sheet-head')).position)).toBe('static');
+  expect(await sheet.locator('.sheet-head').boundingBox()).toEqual(kopfVorher);
+  const getroffen = await page.evaluate(() => {
+    const r = document.querySelector('#close-settings').getBoundingClientRect();
+    return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)?.closest('button')?.id;
+  });
+  expect(getroffen).toBe('close-settings');
+  await page.click('#close-settings');
+  await expect(sheet).toBeHidden();
+});
+
 test('Suche filtert die Liste', async () => {
   await page.click('#toggle-search');
   await page.fill('#search', 'Umzug');
