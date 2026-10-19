@@ -4,6 +4,28 @@ All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/); every release is also published as
 a Docker image `ghcr.io/ariazonaa/todo:X.Y.Z` (plus `:X.Y` and `:X`).
 
+## 1.1.2 — 2026-10-19
+
+### Changed
+
+- **Faster with many tasks.** Loading the list no longer slows down
+  quadratically once tasks are linked: with 1000 tasks it takes about 6 ms
+  instead of 130 ms, with 5000 about 30 ms instead of 4.4 s. Backups export
+  and sharing changes get the same speed-up.
+- Checking off a task in a long list no longer freezes the page: the
+  animation only covers the rows on screen, and each row costs less to
+  build. Search stays smooth while typing.
+- App files (JavaScript, styles, translations, icons) are revalidated
+  instead of downloaded again on every start.
+- On a stalled network the app opens from its offline copy after a few
+  seconds instead of waiting until the browser gives up.
+- Saving changes no longer waits for the disk after every write (SQLite
+  `synchronous=NORMAL` with WAL). A power cut can lose the last few seconds
+  of changes, but never corrupts the database.
+- The example nginx config now compresses JSON, JavaScript and CSS. If you
+  run your own proxy, add the `gzip` block from
+  `deploy/nginx/todo.example.com.conf` — never for `text/event-stream`.
+
 ## 1.1.1 — 2026-10-19
 
 ### Fixed
