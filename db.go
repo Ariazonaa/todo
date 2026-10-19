@@ -193,7 +193,10 @@ type Task struct {
 }
 
 func openDB(path string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", filepath.ToSlash(path))
+	// synchronous(NORMAL): with WAL a commit no longer waits for fsync, only
+	// the checkpoint does. A power cut can cost the last commits, but never
+	// corrupts the database (a process crash costs nothing).
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)", filepath.ToSlash(path))
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -764,8 +767,16 @@ const visibleTaskIDs = "SELECT id FROM tasks WHERE list_id " + visibleLists
 // attachLinks and attachAttachments only read rows of uid's tasks — not
 // those of the whole instance, which someone else's link flood would
 // otherwise make slow for everyone.
+//
+// The unary plus on the second column (`+b IN`) is intentional — in every
+// links query that constrains both columns with IN: without it SQLite seeks
+// the primary key (a=? AND b=?) once per pair of the two lists, n×n (3000
+// tasks: ~1 s per request). With it, it seeks a=? and only checks b against
+// the list. TestLinksQueryPlans pins this down.
+const attachLinksQuery = "SELECT a, b FROM links WHERE a IN (" + visibleTaskIDs + ") AND +b IN (" + visibleTaskIDs + ")"
+
 func attachLinks(db *sql.DB, uid int64, tasks []Task) error {
-	rows, err := db.Query("SELECT a, b FROM links WHERE a IN ("+visibleTaskIDs+") AND b IN ("+visibleTaskIDs+")", uid, uid)
+	rows, err := db.Query(attachLinksQuery, uid, uid)
 	if err != nil {
 		return err
 	}
@@ -830,8 +841,9 @@ const maxLinksPerTask = 100
 var errLinkLimit = errors.New("link limit reached")
 
 // visibleLinks: SQL for the number of links of a task (one placeholder)
-// whose other end uid (two placeholders) can see.
-const visibleLinks = "(SELECT COUNT(*) FROM links WHERE (a = ? AND b IN (" + visibleTaskIDs + ")) OR (b = ? AND a IN (" + visibleTaskIDs + ")))"
+// whose other end uid (two placeholders) can see. Unary plus as in
+// attachLinks: otherwise one PK seek per visible task.
+const visibleLinks = "(SELECT COUNT(*) FROM links WHERE (a = ? AND +b IN (" + visibleTaskIDs + ")) OR (b = ? AND +a IN (" + visibleTaskIDs + ")))"
 
 func linkTasks(db *sql.DB, uid, a, b int64) error {
 	a, b = normalizePair(a, b)
@@ -866,11 +878,16 @@ func linkTasks(db *sql.DB, uid, a, b int64) error {
 // unlinkAcross removes the links between list and the tasks in member's
 // own lists — they leave the list now (left, removed, list deleted), and
 // such a link could afterward be seen and removed by nobody.
+// Unary plus as in attachLinks (n×n PK seeks otherwise).
+const unlinkAcrossQuery = "DELETE FROM links WHERE (a IN (" + unlinkInList + ") AND +b IN (" + unlinkTheirs + ")) OR (b IN (" + unlinkInList + ") AND +a IN (" + unlinkTheirs + "))"
+
+const (
+	unlinkInList = "SELECT id FROM tasks WHERE list_id = ?"
+	unlinkTheirs = "SELECT id FROM tasks WHERE list_id IN (SELECT id FROM lists WHERE owner_id = ?)"
+)
+
 func unlinkAcross(ex execer, list, member int64) error {
-	const inList = "SELECT id FROM tasks WHERE list_id = ?"
-	const theirs = "SELECT id FROM tasks WHERE list_id IN (SELECT id FROM lists WHERE owner_id = ?)"
-	_, err := ex.Exec("DELETE FROM links WHERE (a IN ("+inList+") AND b IN ("+theirs+")) OR (b IN ("+inList+") AND a IN ("+theirs+"))",
-		list, member, list, member)
+	_, err := ex.Exec(unlinkAcrossQuery, list, member, list, member)
 	return err
 }
 

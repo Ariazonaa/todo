@@ -264,6 +264,22 @@ test('Suche filtert die Liste', async () => {
   await expect(page.locator('#list li.task').first()).toBeVisible();
 });
 
+// Typing renders once per frame: what counts is the last state of the field,
+// not a keystroke in between. Case doesn't matter, and a hit in a subtask
+// keeps its parent task visible.
+test('Suche: schnelles Tippen, Groß/klein, Treffer in Unteraufgabe', async () => {
+  await page.click('#toggle-search');
+  await page.locator('#search').pressSequentially('KARTONS', { delay: 0 });
+  const eltern = page.locator('#list > section li.task:not(.subtask)', { hasText: 'Umzug' });
+  await expect(eltern).toHaveCount(1);
+  await expect(eltern.locator('.subs li.task', { hasText: 'Kartons besorgen' })).toHaveCount(1);
+  await expect(page.locator('#list li.task', { hasText: 'Aufgabe 1' })).toHaveCount(0);
+  await page.locator('#search').pressSequentially('xyz', { delay: 0 });
+  await expect(page.locator('#list .empty')).toBeVisible();
+  await page.click('#toggle-search');
+  await expect(page.locator('#list li.task', { hasText: 'Aufgabe 1' }).first()).toBeVisible();
+});
+
 // A modal dialog makes everything outside it inert. That's why the toast
 // used to sit invisibly behind the sheet ("Titel fehlt" went unseen), and
 // its undo button wasn't clickable.

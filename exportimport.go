@@ -76,6 +76,10 @@ type exportData struct {
 	Settings    appSettings        `json:"settings"`
 }
 
+// exportLinksQuery: links between the own tasks. Unary plus as in
+// attachLinks (n×n PK seeks otherwise).
+const exportLinksQuery = "SELECT a, b FROM links WHERE a IN (SELECT id FROM tasks WHERE list_id " + ownedLists + ") AND +b IN (SELECT id FROM tasks WHERE list_id " + ownedLists + ")"
+
 func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
 	// Only own data: own lists (ownedLists — shared lists belong to their
 	// owner), their tasks, links between them, images, stats.
@@ -128,7 +132,7 @@ func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 	rows.Close()
 	own := "SELECT id FROM tasks WHERE list_id " + ownedLists
-	lrows, err := s.db.Query("SELECT a, b FROM links WHERE a IN ("+own+") AND b IN ("+own+")", uid, uid)
+	lrows, err := s.db.Query(exportLinksQuery, uid, uid)
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return

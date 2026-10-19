@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"io/fs"
 	"log"
@@ -234,18 +236,51 @@ func secHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// staticFile serves an embedded file with no-cache, so the service
-// worker/browser always gets fresh assets after a deploy.
+// staticETags: SHA-256 of every embedded file, computed once at start.
+// embed.FS reports ModTime 0, so without an ETag there is neither
+// Last-Modified nor a 304 — every no-cache revalidation downloaded the
+// whole file again.
+var staticETags = hashStatic()
+
+func hashStatic() map[string]string {
+	tags := map[string]string{}
+	err := fs.WalkDir(staticFS, "static", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := staticFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		tags[path] = `"` + hex.EncodeToString(sum[:16]) + `"`
+		return nil
+	})
+	if err != nil {
+		panic(err) // embedded: can only be a build error
+	}
+	return tags
+}
+
+// serveStatic serves an embedded file with no-cache, so the service
+// worker/browser always gets fresh assets after a deploy — the ETag makes
+// the revalidation a 304 (ServeFileFS evaluates If-None-Match against it).
+func serveStatic(w http.ResponseWriter, r *http.Request, path string) {
+	w.Header().Set("Cache-Control", "no-cache")
+	if tag, ok := staticETags[path]; ok {
+		w.Header().Set("ETag", tag)
+	}
+	http.ServeFileFS(w, r, staticFS, path)
+}
+
 func staticFile(path string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
-		http.ServeFileFS(w, r, staticFS, path)
+		serveStatic(w, r, path)
 	}
 }
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-cache")
-	http.ServeFileFS(w, r, staticFS, "static/index.html")
+	serveStatic(w, r, "static/index.html")
 }
 
 func (s *server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
@@ -257,8 +292,7 @@ func (s *server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	w.Header().Set("Cache-Control", "no-cache")
-	http.ServeFileFS(w, r, staticFS, "static/login.html")
+	serveStatic(w, r, "static/login.html")
 }
 
 // handleSetupPage: first account or an account with a setup code —
@@ -268,8 +302,7 @@ func (s *server) handleSetupPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	w.Header().Set("Cache-Control", "no-cache")
-	http.ServeFileFS(w, r, staticFS, "static/setup.html")
+	serveStatic(w, r, "static/setup.html")
 }
 
 // newHTTPServer: without a read and idle timeout, keep-alive connections
@@ -303,6 +336,11 @@ func iconHandler() http.Handler {
 		if strings.HasSuffix(r.URL.Path, "/") {
 			http.NotFound(w, r)
 			return
+		}
+		// ETag like serveStatic (FileServerFS evaluates it as well).
+		w.Header().Set("Cache-Control", "no-cache")
+		if tag, ok := staticETags["static"+r.URL.Path]; ok {
+			w.Header().Set("ETag", tag)
 		}
 		files.ServeHTTP(w, r)
 	})

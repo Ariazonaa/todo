@@ -1,5 +1,5 @@
 // Bump this on every frontend change, otherwise offline usage gets stuck on the old version.
-const CACHE = 'todo-v44';
+const CACHE = 'todo-v45';
 const ASSETS = [
   '/style.css',
   '/i18n.js',
@@ -39,6 +39,10 @@ self.addEventListener('activate', (e) => {
 
 // Network-first with a cache fallback for our own static assets and navigations.
 // /api/ is never touched: data always comes live from the server.
+// A network that hangs (dead Wi-Fi, a stalled proxy) would leave the app
+// blank until the browser gives up: after NET_TIMEOUT the cached copy answers,
+// if there is one — the request keeps running and still refreshes the cache.
+const NET_TIMEOUT = 3500;
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== location.origin || url.pathname.startsWith('/api/')) {
@@ -48,35 +52,50 @@ self.addEventListener('fetch', (e) => {
   // every /?task=<id> from a notification would add another copy.
   const navigate = e.request.mode === 'navigate';
   const key = navigate && url.pathname === '/' ? '/' : e.request;
-  e.respondWith(
-    fetch(e.request)
-      .then((res) => {
-        if (res.ok && !res.redirected) {
-          const clone = res.clone();
-          // waitUntil: the worker may otherwise be stopped before the write
-          e.waitUntil(caches.open(CACHE).then((c) => c.put(key, clone)).catch(() => {}));
-        }
-        return res;
-      })
-      .catch(async () => {
-        const m = await caches.match(key);
-        if (m) return m;
-        if (navigate) {
-          const shell = await caches.match('/');
-          if (shell) return shell;
-          // The worker doesn't know the catalog — the device's language is good enough.
-          const de = (self.navigator.language || '').toLowerCase().startsWith('de');
-          const [lang, text] = de
-            ? ['de', 'Offline — bitte einmal mit Internet öffnen.']
-            : ['en', 'Offline — please open once with an internet connection.'];
-          return new Response(
-            `<!DOCTYPE html><html lang="${lang}"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Todo — offline</title><body style="font-family:system-ui;display:grid;place-items:center;min-height:100dvh;margin:0"><p>${text}</p></body></html>`,
-            { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-          );
-        }
-        return Response.error();
-      })
-  );
+  const net = fetch(e.request).then((res) => {
+    if (res.ok && !res.redirected) {
+      const clone = res.clone();
+      // waitUntil: the worker may otherwise be stopped before the write
+      e.waitUntil(caches.open(CACHE).then((c) => c.put(key, clone)).catch(() => {}));
+    }
+    return res;
+  });
+  // Keeps the worker alive for the cache update after a timeout answer.
+  e.waitUntil(net.catch(() => {}));
+  const fallback = async () => {
+    const m = await caches.match(key);
+    if (m) return m;
+    if (navigate) {
+      const shell = await caches.match('/');
+      if (shell) return shell;
+      // The worker doesn't know the catalog — the device's language is good enough.
+      const de = (self.navigator.language || '').toLowerCase().startsWith('de');
+      const [lang, text] = de
+        ? ['de', 'Offline — bitte einmal mit Internet öffnen.']
+        : ['en', 'Offline — please open once with an internet connection.'];
+      return new Response(
+        `<!DOCTYPE html><html lang="${lang}"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Todo — offline</title><body style="font-family:system-ui;display:grid;place-items:center;min-height:100dvh;margin:0"><p>${text}</p></body></html>`,
+        { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+      );
+    }
+    return Response.error();
+  };
+  e.respondWith((async () => {
+    let timer;
+    const slow = new Promise((r) => { timer = setTimeout(r, NET_TIMEOUT); });
+    try {
+      const res = await Promise.race([net, slow]);
+      if (res) return res;
+      // Too slow: only an exact cached copy — no shell for /login or /setup,
+      // a real page would be wrong there. Without one, keep waiting.
+      const m = await caches.match(key);
+      return m || await net;
+    } catch {
+      return fallback();
+    } finally {
+      clearTimeout(timer);
+    }
+  })());
 });
 
 // --- Web push (content and buttons: push.go / scheduler.go) ---

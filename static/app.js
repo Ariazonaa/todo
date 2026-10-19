@@ -34,7 +34,22 @@ let lockedScrollY = null;   // scroll position while a sheet is open (see syncSc
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 const byId = (id) => TASKS.find((t) => t.id === id);
-const subsOf = (id) => TASKS.filter((t) => t.parent_id === id && !hiddenIds.has(t.id));
+// Built once per load (indexTasks): a filter over all TASKS per row made
+// every render quadratic.
+let SUBS = new Map();          // parent_id -> subtasks, in TASKS order
+let LOWER = new WeakMap();     // task -> { title, note } lowercased for the search
+const subsOf = (id) => (SUBS.get(id) || []).filter((t) => !hiddenIds.has(t.id));
+function indexTasks() {
+  SUBS = new Map();
+  LOWER = new WeakMap();
+  for (const x of TASKS) {
+    if (x.parent_id) {
+      const arr = SUBS.get(x.parent_id);
+      if (arr) arr.push(x); else SUBS.set(x.parent_id, [x]);
+    }
+    LOWER.set(x, { title: x.title.toLowerCase(), note: (x.note || '').toLowerCase() });
+  }
+}
 
 async function api(path, opts = {}) {
   let res;
@@ -188,12 +203,20 @@ const ICONS = {
   people: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="9" r="2.6"/><path d="M15.5 14.2A4.6 4.6 0 0 1 21 18.5"/>',
   list: '<line x1="9" y1="7" x2="20" y2="7"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="17" x2="20" y2="17"/><circle cx="4.5" cy="7" r="1"/><circle cx="4.5" cy="12" r="1"/><circle cx="4.5" cy="17" r="1"/>',
 };
+// Each icon is parsed once and cloned afterwards — innerHTML per row was a
+// markup parse for every button of every task on every render.
+const iconTpl = new Map();
 function icon(name, cls = 'ic') {
-  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  s.setAttribute('viewBox', '0 0 24 24');
-  s.setAttribute('aria-hidden', 'true');
+  let tpl = iconTpl.get(name);
+  if (!tpl) {
+    tpl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    tpl.setAttribute('viewBox', '0 0 24 24');
+    tpl.setAttribute('aria-hidden', 'true');
+    tpl.innerHTML = ICONS[name];
+    iconTpl.set(name, tpl);
+  }
+  const s = tpl.cloneNode(true);
   s.setAttribute('class', cls);
-  s.innerHTML = ICONS[name];
   return s;
 }
 function chip(iconName, text) {
@@ -306,13 +329,41 @@ function rerender() {
   // snapshots the whole page and would flash the list visibly behind the
   // backdrop (e.g. on every image upload via an SSE event).
   if (document.startViewTransition && motionOK && !document.querySelector('dialog[open]')) {
-    document.startViewTransition(() => render());
+    const named = nameVisibleRows();
+    document.startViewTransition(() => {
+      render();
+      nameVisibleRows(named);
+    });
   } else {
     render();
   }
   // Update the open sheet too — otherwise a subtask deleted inside it would
   // only disappear from its list once the undo window expires.
   if (editId !== null && editDlg.open) refreshEditLists();
+}
+
+// nameVisibleRows gives a view-transition-name only to rows in or near the
+// viewport (plus those named in the old state, keep — so a row that slides
+// out of view still glides there). Every named element is its own snapshot:
+// with hundreds of rows a transition over all of them stalled every tap.
+// Reads all rects first, then writes — one layout, no thrashing.
+function nameVisibleRows(keep) {
+  const rows = [...$('#list').querySelectorAll('li.task')];
+  const margin = innerHeight / 2;
+  const rects = rows.map((r) => r.getBoundingClientRect());
+  const named = new Set();
+  rows.forEach((r, i) => {
+    const b = rects[i];
+    const id = r.dataset.id;
+    const near = b.height > 0 && b.bottom > -margin && b.top < innerHeight + margin;
+    if (near || keep?.has(id)) {
+      r.style.viewTransitionName = 'task-' + id;
+      named.add(id);
+    } else {
+      r.style.viewTransitionName = '';
+    }
+  });
+  return named;
 }
 
 // In-app confirmation dialog (iOS action-sheet style)
@@ -410,10 +461,11 @@ function hideToast() {
 
 // --- Search ---
 
+let searchQ = ''; // searchTerm lowercased, once per input instead of per task
 function matchesSearch(t) {
   if (!searchTerm) return true;
-  const q = searchTerm.toLowerCase();
-  return t.title.toLowerCase().includes(q) || (t.note || '').toLowerCase().includes(q);
+  const l = LOWER.get(t) || { title: t.title.toLowerCase(), note: (t.note || '').toLowerCase() };
+  return l.title.includes(searchQ) || l.note.includes(searchQ);
 }
 function visibleTop(t) {
   return matchesSearch(t) || subsOf(t.id).some(matchesSearch);
@@ -546,8 +598,7 @@ function attachDrag(handle, li) {
 
 function taskRow(task, isSub, prio) {
   const li = el('li', 'task' + (task.done ? ' done' : '') + (isSub ? ' subtask' : ''));
-  li.dataset.id = String(task.id);
-  li.style.viewTransitionName = 'task-' + task.id;
+  li.dataset.id = String(task.id); // the clicks are handled on #list (onListClick)
   const row = el('div', 'rowline');
 
   // Priority number: counted top to bottom within each section
@@ -567,7 +618,7 @@ function taskRow(task, isSub, prio) {
   const check = el('button', 'check' + prioClass(task));
   check.append(icon('check'));
   check.setAttribute('aria-label', withPrio(task.done ? t('task.reopen', { title: task.title }) : t('task.complete', { title: task.title }), task));
-  check.addEventListener('click', () => toggleTask(task, li));
+  check.dataset.act = 'check';
 
   const body = el('div', 'body');
   body.append(el('div', 'title', task.title));
@@ -581,17 +632,15 @@ function taskRow(task, isSub, prio) {
       img.src = `/api/tasks/${task.id}/attachments/${aid}/thumb`; // small preview, full size only in the lightbox
       img.alt = t('image.alt');
       img.loading = 'lazy';
-      img.addEventListener('click', (e) => {
-        e.stopPropagation(); // don't also open the edit sheet
-        openLightbox(`/api/tasks/${task.id}/attachments/${aid}`);
-      });
+      img.decoding = 'async';
+      img.dataset.aid = String(aid);
       strip.append(img);
     }
     body.append(strip);
   }
   const meta = metaFor(task);
   if (meta.childNodes.length) body.append(meta);
-  body.addEventListener('click', () => openEdit(task.id));
+  body.dataset.act = 'edit';
 
   row.append(check, body);
 
@@ -601,19 +650,7 @@ function taskRow(task, isSub, prio) {
     prog.append(icon(task.in_progress ? 'pause' : 'play'));
     prog.setAttribute('aria-label', task.in_progress ? t('task.progress_off', { title: task.title }) : t('task.progress_on', { title: task.title }));
     prog.title = task.in_progress ? t('task.progress_stop') : t('section.in_progress');
-    prog.addEventListener('click', async () => {
-      if (inflight.has(task.id)) return;
-      inflight.add(task.id);
-      try {
-        const res = await api(`/api/tasks/${task.id}/progress`, { method: 'POST', body: JSON.stringify({ on: !task.in_progress }) });
-        if (await failed(res)) return;
-      } catch {
-        return;
-      } finally {
-        inflight.delete(task.id);
-      }
-      loadTasks();
-    });
+    prog.dataset.act = 'progress';
     row.append(prog);
   }
 
@@ -622,13 +659,13 @@ function taskRow(task, isSub, prio) {
     snoozeBtn.append(icon('forward'));
     snoozeBtn.setAttribute('aria-label', t('task.snooze', { title: task.title }));
     snoozeBtn.title = t('snooze.day');
-    snoozeBtn.addEventListener('click', () => snooze(task, 1));
+    snoozeBtn.dataset.act = 'snooze';
     row.append(snoozeBtn);
   }
   const del = el('button', 'rowbtn del');
   del.append(icon('xmark'));
   del.setAttribute('aria-label', t('task.delete', { title: task.title }));
-  del.addEventListener('click', () => deleteTask(task));
+  del.dataset.act = 'del';
   row.append(del);
 
   li.append(row);
@@ -644,6 +681,44 @@ function taskRow(task, isSub, prio) {
   }
   return li;
 }
+
+async function toggleProgress(task) {
+  if (inflight.has(task.id)) return;
+  inflight.add(task.id);
+  try {
+    const res = await api(`/api/tasks/${task.id}/progress`, { method: 'POST', body: JSON.stringify({ on: !task.in_progress }) });
+    if (await failed(res)) return;
+  } catch {
+    return;
+  } finally {
+    inflight.delete(task.id);
+  }
+  loadTasks();
+}
+
+// One listener for all rows instead of five closures per row and render:
+// the row's li carries the task ID, the clicked element its action (data-act).
+// The drag handle keeps its own listeners (attachDrag).
+$('#list').addEventListener('click', (e) => {
+  const li = e.target.closest('li.task');
+  if (!li) return;
+  const task = byId(Number(li.dataset.id));
+  if (!task) return;
+  const img = e.target.closest('.rowthumbs img');
+  if (img) { // don't also open the edit sheet
+    openLightbox(`/api/tasks/${task.id}/attachments/${img.dataset.aid}`);
+    return;
+  }
+  const act = e.target.closest('[data-act]');
+  if (!act || !li.contains(act)) return;
+  switch (act.dataset.act) {
+    case 'check': toggleTask(task, li); break;
+    case 'edit': openEdit(task.id); break;
+    case 'progress': toggleProgress(task); break;
+    case 'snooze': snooze(task, 1); break;
+    case 'del': deleteTask(task); break;
+  }
+});
 
 // Delete without confirmation, but with undo: the task disappears from the
 // view immediately, and the DELETE request only goes out once the undo
@@ -875,6 +950,7 @@ async function fetchTasks() {
     TODAY = data.today;
     TOMORROW = addDays(TODAY, 1);
     TASKS = data.tasks;
+    indexTasks();
     LISTS = data.lists;
     INVITES = data.invites || [];
     // The selected list no longer exists (another device deleted it)
@@ -1043,6 +1119,7 @@ function renderAttachments(task) {
     img.src = `/api/tasks/${task.id}/attachments/${aid}/thumb`;
     img.alt = t('image.alt');
     img.loading = 'lazy';
+    img.decoding = 'async';
     img.addEventListener('click', () => openLightbox(`/api/tasks/${task.id}/attachments/${aid}`));
     const del = el('button', 'thumbdel');
     del.append(icon('xmark'));
@@ -1355,12 +1432,20 @@ $('#toggle-search').addEventListener('click', () => {
   } else {
     $('#search').value = '';
     searchTerm = '';
+    searchQ = '';
     rerender();
   }
 });
+// Fast typing renders once per frame, not once per keystroke.
+let searchRaf = 0;
 $('#search').addEventListener('input', () => {
-  searchTerm = $('#search').value.trim();
-  render(); // no transition while typing, otherwise every keystroke stutters
+  if (searchRaf) return;
+  searchRaf = requestAnimationFrame(() => {
+    searchRaf = 0;
+    searchTerm = $('#search').value.trim();
+    searchQ = searchTerm.toLowerCase();
+    render(); // no transition while typing, otherwise every keystroke stutters
+  });
 });
 
 // --- Lists ---
