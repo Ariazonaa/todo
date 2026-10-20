@@ -4,6 +4,67 @@ All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/); every release is also published as
 a Docker image `ghcr.io/ariazonaa/todo:X.Y.Z` (plus `:X.Y` and `:X`).
 
+## 1.2.0 — 2026-10-20
+
+### Before you update
+
+- **The first start migrates the database once:** the tasks table is rebuilt
+  so deleted task IDs are never handed out again, and stored passkeys are
+  slimmed down. Make the backup from "Update" in the README first, as before
+  every update.
+- **Behind Caddy**, add `header_up X-Real-IP {remote_host}` to
+  `reverse_proxy` (README, "Reverse proxy and passkeys"). Caddy doesn't set
+  the header and passes on whatever the client sends — the rate limits then
+  counted everyone as one client, or every client as whoever it claimed to be.
+- **At most 10,000 tasks in one person's lists** (was 100,000). An account
+  above that can't add tasks until some are deleted or archived; the log
+  names it at startup. Backups with more tasks can't be imported anymore.
+
+### Security
+
+- **A passkey can no longer be registered under another passkey's ID.**
+  Sign-in finds the account by that ID, and anyone can read the IDs: another
+  account could lock any account — the admin's too — out for good. The first
+  start removes existing copies along with their sessions and push devices.
+- **Accepting an invitation and turning on push on a new device need a fresh
+  sign-in**, like inviting already did. With a stolen session cookie,
+  someone could otherwise move your tasks into a list of their own, or have
+  your task titles pushed to their device even after "Sign out everywhere".
+  Devices that are already registered keep working without asking.
+- **The Discord webhook URL is no longer shown in full**, only with its token
+  masked, and backups don't contain it anymore — whoever has the whole URL can
+  post to the channel. After restoring a backup on a new instance, enter it
+  again.
+- The rate limits only accept a valid address in `X-Real-IP`.
+
+### Changed
+
+- **Limits per account**, so one account can't exhaust the server for
+  everyone: at most 20 passkeys and 10 devices with push; push only goes to
+  the known push services on their standard port.
+- **The task list and backups are written out piece by piece** instead of
+  being assembled in memory first — with many long notes, a single load used
+  to take hundreds of MB. Loading the list, downloading a backup and opening
+  full-size images take turns per person; a client that stops reading a
+  response is disconnected after a minute.
+- A new passkey is stored without the extra data the browser sends along
+  (attestation, unknown transports) — every sign-in reads all passkeys of
+  the instance.
+- With an older session, turning on push first asks for your passkey; then
+  tap the switch once more (Safari allows only one prompt per tap). When a
+  device's push registration is gone, the app says so instead of showing
+  push as on.
+
+### Fixed
+
+- **Deleted task IDs no longer come back.** An undo-delete sent late, the
+  auto-archive or a notification's "Done" could hit a new task that had been
+  given the same ID — in a shared list, someone else's.
+- Thumbnails that still had to be generated: waiting requests no longer each
+  hold the full image in memory, and they stop waiting when the page is
+  closed. An image the decoder chokes on no longer stalls every upload after
+  it.
+
 ## 1.1.2 — 2026-10-19
 
 ### Changed
