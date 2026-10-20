@@ -179,6 +179,28 @@ func validateSettings(s appSettings) error {
 	return nil
 }
 
+// maskWebhook: the webhook URL as the settings show it — up to the webhook
+// ID (…/webhooks/{id}/), the rest masked: the token, and whatever follows it
+// (/slack, /github). Whoever has the whole URL can post to the channel
+// under any name, rename or delete the webhook — even after "sign out
+// everywhere"; a session cookie alone mustn't reveal it.
+func maskWebhook(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "…"
+	}
+	segs := strings.Split(u.Path, "/")
+	for i, seg := range segs {
+		if seg == "webhooks" && i+1 < len(segs) {
+			return u.Scheme + "://" + u.Host + strings.Join(segs[:i+2], "/") + "/…"
+		}
+	}
+	return u.Scheme + "://" + u.Host + "/…"
+}
+
 // save stores uid's webhook, timezone and digest time. Language
 // (saveLanguage) and archive retention period (saveArchiveDays) are left
 // untouched.

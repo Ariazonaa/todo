@@ -128,16 +128,32 @@ An nginx example (HTTPS, HTTP/3, HSTS, Host header, upload limits) is in
   changing the domain later means registering new ones.
 - Don't publish the container port on all interfaces: the app trusts the
   proxy's `X-Real-IP` (the compose file binds to `127.0.0.1`).
+- The proxy must **set `X-Real-IP`** to the client's address — rate limits
+  count per address. The nginx example does (`proxy_set_header X-Real-IP
+  $remote_addr;`). Caddy doesn't, and passes on whatever the client sent:
+  without `header_up`, every client could pick its own address.
+
+  ```caddyfile
+  todo.example.com {
+      reverse_proxy 127.0.0.1:8080 {
+          header_up X-Real-IP {remote_host}
+      }
+  }
+  ```
 - An instance without an admin passkey only accepts the **setup code** from
   its log — knowing the URL isn't enough to take it over. Every restart
   without one creates a new code.
 - Passkeys need **user verification** (PIN/biometrics). A security key
   without a PIN won't do — set a PIN first.
 - **Adding/removing passkeys**, creating or removing accounts and setup codes,
-  sharing a list, changing the Discord webhook and importing a backup require
-  a fresh sign-in (at most 10 minutes old); otherwise the app asks for one of
-  your passkeys first. A stolen session cookie alone can't turn into lasting
+  sharing a list or accepting an invitation, changing the Discord webhook,
+  turning on push on a new device and importing a backup require a fresh
+  sign-in (at most 10 minutes old); otherwise the app asks for one of your
+  passkeys first. A stolen session cookie alone can't turn into lasting
   access this way.
+- The settings show the **Discord webhook** only with its token masked, and
+  backups don't contain it — whoever has the whole URL can post to the
+  channel. After restoring a backup on a new instance, enter it again.
 
 ### Locked out? (all passkeys lost)
 
@@ -192,9 +208,15 @@ language (`DATE_VOCAB` in `static/dateparse.js`).
 - **Monthly repeat:** tasks on the 29th–31st clamp to the 28th in February
   and stay on the 28th afterwards (documented drift, pinned in tests).
 - **Due dates** are local wall-clock strings in each person's time zone.
+- **Limits** keep one account from exhausting the server: at most 10,000
+  tasks in one person's lists (tasks in a shared list count for its owner),
+  20 passkeys and 10 devices with push per account.
 - **Backups of the database file:** WAL mode — don't just copy `todo.db`
   while running; use `sqlite3 data/todo.db "VACUUM INTO 'backup.db'"` or
-  stop, copy, start. The database also contains the passkeys.
+  stop, copy, start. The database also contains the passkeys. An index on
+  the passkeys uses SQLite's JSON functions: the `sqlite3` tool needs them
+  for this and for the recovery below (built in since 3.38, part of most
+  older builds too).
 - **After downtime** missed time pings fire exactly once; the digest only
   covers the current day (overdue tasks are in it anyway).
 

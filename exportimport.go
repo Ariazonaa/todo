@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -80,10 +79,20 @@ type exportData struct {
 // attachLinks (n×n PK seeks otherwise).
 const exportLinksQuery = "SELECT a, b FROM links WHERE a IN (SELECT id FROM tasks WHERE list_id " + ownedLists + ") AND +b IN (SELECT id FROM tasks WHERE list_id " + ownedLists + ")"
 
+// exportSlots: one backup per person at a time, two overall — each holds
+// the person's tasks in memory until they're written out, then one image
+// at a time.
+var exportSlots = newWaitSlots(1, 2)
+
 func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
 	// Only own data: own lists (ownedLists — shared lists belong to their
 	// owner), their tasks, links between them, images, stats.
 	uid := userID(r)
+	release, ok := exportSlots.acquire(r.Context(), uid)
+	if !ok {
+		return // client gone while waiting
+	}
+	defer release()
 	data := exportData{
 		ExportedAt: time.Now().UTC().Format(time.RFC3339),
 		Tasks:      []exportTask{},
@@ -91,6 +100,9 @@ func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
 		Stats:      map[string]int{},
 		Settings:   s.store.get(userID(r)),
 	}
+	// Never the webhook URL: it's a credential for the Discord channel
+	// (maskWebhook), and a backup gets passed around and lies in Downloads.
+	data.Settings.WebhookURL = ""
 	lists, err := listLists(s.db, userID(r))
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
@@ -199,34 +211,42 @@ func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 	arows.Close()
 
-	head, err := json.Marshal(struct {
-		ExportedAt string         `json:"exported_at"`
-		Lists      []exportList   `json:"lists"`
-		Tasks      []exportTask   `json:"tasks"`
-		Links      [][2]int64     `json:"links"`
-		Stats      map[string]int `json:"stats"`
-	}{data.ExportedAt, data.Lists, data.Tasks, data.Links, data.Stats})
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
-	settings, err := json.Marshal(data.Settings)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Disposition",
 		fmt.Sprintf("attachment; filename=\"todo-backup-%s.json\"", s.nowFor(userID(r)).Format(dateFmt)))
-	bw := bufio.NewWriterSize(w, 64<<10)
-	// Same field order as exportData: head without the closing brace.
-	// A write error means: client gone — then stop silently.
-	if _, err := bw.Write(append(head[:len(head)-1], `,"attachments":[`...)); err != nil {
-		return
+	// Written value by value (jsonStream), in exportData's field order. A
+	// write error means: client gone — then stop silently.
+	js := newJSONStream(w, time.Time{}) // a backup may take its time
+	js.raw(`{"exported_at":`)
+	js.value(data.ExportedAt)
+	js.raw(`,"lists":`)
+	js.value(data.Lists)
+	js.raw(`,"tasks":[`)
+	for i := range data.Tasks {
+		if i > 0 {
+			js.raw(",")
+		}
+		js.value(&data.Tasks[i])
 	}
+	js.raw(`],"links":[`)
+	for i, l := range data.Links {
+		if i > 0 {
+			js.raw(",")
+		}
+		js.value(l)
+	}
+	js.raw(`],"stats":`)
+	js.value(data.Stats)
+	// The images can take a while to download — the tasks needn't stay in
+	// memory meanwhile.
+	data.Tasks, data.Links = nil, nil
+	js.raw(`,"attachments":[`)
 	first := true
 	for _, id := range attIDs {
+		if js.err != nil {
+			return
+		}
 		var a exportAttachment
 		err := s.db.QueryRow("SELECT id, task_id, mime, created_at, data FROM attachments WHERE id = ? AND task_id IN ("+own+")", id, uid).
 			Scan(&a.ID, &a.TaskID, &a.Mime, &a.CreatedAt, &a.Data)
@@ -238,25 +258,16 @@ func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
 			// shows an error instead of saving an incomplete backup.
 			panic(http.ErrAbortHandler)
 		}
-		b, err := json.Marshal(a)
-		if err != nil {
-			panic(http.ErrAbortHandler)
-		}
 		if !first {
-			if err := bw.WriteByte(','); err != nil {
-				return
-			}
+			js.raw(",")
 		}
 		first = false
-		if _, err := bw.Write(b); err != nil {
-			return
-		}
+		js.value(a)
 	}
-	tail := append(append([]byte(`],"settings":`), settings...), "}\n"...)
-	if _, err := bw.Write(tail); err != nil {
-		return
-	}
-	_ = bw.Flush() // last write attempt; client gone is not a server error
+	js.raw(`],"settings":`)
+	js.value(data.Settings)
+	js.raw("}\n")
+	_ = js.flush() // last write attempt; client gone is not a server error
 }
 
 // handleImport replaces the entire data set with the backup
@@ -762,7 +773,11 @@ func (s *server) stageAttachments(dec *json.Decoder, lim *elemLimit, uid int64) 
 // note) is checked by the import after decoding. Real data sets are orders of
 // magnitude below these limits.
 const (
-	maxImportTasks = 100_000
+	// Also maxTasksPerOwner: 10,000 tasks at full length (title and note,
+	// up to 4 bytes per character) are ~220 MB in memory — as much as a
+	// backup holds while it's written out, and a list load for every owner
+	// whose lists it shows (exportSlots, taskLoads).
+	maxImportTasks = 10_000
 	maxImportLinks = 1_000_000
 	maxImportStats = 100_000 // days, ~270 years
 )

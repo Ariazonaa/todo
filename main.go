@@ -67,6 +67,7 @@ func main() {
 	}
 	defer db.Close()
 
+	warnOverTaskLimit(db)
 	store, err := newSettingsStore(db)
 	if err != nil {
 		log.Fatalf("load settings: %v", err)
@@ -317,6 +318,52 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+}
+
+// writeIdle: how long one chunk of a long response may take. Long
+// responses (task list, backup, originals) have no overall deadline — the
+// server has no WriteTimeout because of SSE — but go out in chunks of 64 KB,
+// each with this much time (idleWriter): a client that stops reading lets
+// go of what its response holds in memory after that, a slow one that keeps
+// reading (64 KB a minute) isn't cut off. A variable for tests.
+var writeIdle = time.Minute
+
+// taskListWriteMax: the task list holds one of few slots overall while it's
+// written (taskLoads) — a client reading just fast enough for every chunk
+// mustn't keep it for good. Generous: a long list over a bad connection
+// still gets through. A variable for tests.
+var taskListWriteMax = 2 * time.Minute
+
+// idleWriter writes through w in chunks, each with a fresh write deadline of
+// writeIdle (see above), but never past until if that's set.
+type idleWriter struct {
+	w     http.ResponseWriter
+	rc    *http.ResponseController
+	until time.Time
+}
+
+func newIdleWriter(w http.ResponseWriter, until time.Time) idleWriter {
+	return idleWriter{w: w, rc: http.NewResponseController(w), until: until}
+}
+
+func (iw idleWriter) Write(p []byte) (int, error) {
+	n := 0
+	for len(p) > 0 {
+		chunk := p[:min(len(p), 64<<10)]
+		deadline := time.Now().Add(writeIdle)
+		if !iw.until.IsZero() && iw.until.Before(deadline) {
+			deadline = iw.until
+		}
+		// Error only if the writer can't do this (tests using ResponseRecorder).
+		_ = iw.rc.SetWriteDeadline(deadline)
+		k, err := iw.w.Write(chunk)
+		n += k
+		if err != nil {
+			return n, err
+		}
+		p = p[len(chunk):]
+	}
+	return n, nil
 }
 
 // extendReadDeadline gives a large upload more time than ReadTimeout.

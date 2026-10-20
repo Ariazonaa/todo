@@ -428,10 +428,16 @@ func isMember(db *sql.DB, list, member int64) bool {
 
 // handleAcceptInvite: uid accepts an invitation — from then on, the list is
 // visible to them. Declining is leaving (handleRemoveMember with their own ID).
+// Accepting needs a fresh login, like inviting: with a stolen session cookie
+// the thief would accept an invitation into a list of his own and move the
+// account's tasks there — they'd stay his after "sign out everywhere".
 func (s *server) handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
 	list, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "error.bad_id")
+		return
+	}
+	if !s.requireFreshAuth(w, r) {
 		return
 	}
 	uid := userID(r)

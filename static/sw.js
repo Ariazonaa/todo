@@ -1,5 +1,5 @@
 // Bump this on every frontend change, otherwise offline usage gets stuck on the old version.
-const CACHE = 'todo-v45';
+const CACHE = 'todo-v47';
 const ASSETS = [
   '/style.css',
   '/i18n.js',
@@ -141,9 +141,9 @@ self.addEventListener('notificationclick', (e) => {
   e.notification.close();
   e.waitUntil((async () => {
     if (taskId && (e.action === 'done' || e.action === 'snooze')) {
-      // expected_due_date on both actions: tasks.id gets reused after deletion,
-      // so a day-old notification must not complete/snooze a different, newer
-      // task (handleCompleteTask/handleSnoozeTask).
+      // expected_due_date on both actions: a day-old notification must not
+      // complete/snooze the task once its due date has moved on
+      // (handleCompleteTask/handleSnoozeTask).
       const body = e.action === 'done'
         ? { expected_due_date: dueDate || '' }
         : { days: 1, expected_due_date: dueDate || '' };
@@ -171,10 +171,12 @@ self.addEventListener('pushsubscriptionchange', (e) => {
     const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4));
     const key = Uint8Array.from(bin, (c) => c.charCodeAt(0));
     const sub = await self.registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+    // old_endpoint: the server takes this as the device's successor — a new
+    // device would need a fresh login, which the service worker can't do.
     await fetch('/api/push/subscription', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sub.toJSON()),
+      body: JSON.stringify({ ...sub.toJSON(), old_endpoint: e.oldSubscription?.endpoint || '' }),
     });
   })());
 });

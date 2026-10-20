@@ -3,11 +3,16 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"image"
 	"image/png"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+
+	"github.com/go-webauthn/webauthn/webauthn"
 )
 
 // A plain strings.HasSuffix(host, "discord.com") would let "evildiscord.com"
@@ -246,5 +251,134 @@ func TestOpenDBMigratesExistingFile(t *testing.T) {
 	var n int
 	if err := db2.QueryRow("SELECT COUNT(*) FROM attachments").Scan(&n); err != nil || n != 2 {
 		t.Fatalf("nach Neustart n=%d err=%v", n, err)
+	}
+}
+
+// Instances from before the unique index may already hold a second row
+// under someone else's passkey ID, and attestations of any size. The
+// upgrade keeps the oldest row, removes the copy along with its sessions
+// and devices, and slims down what remains.
+func TestMigrationCleansUpStoredPasskeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "todo.db")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	admin, _ := createUser(db, "Admin", true, []byte("todo-single-user"))
+	bea, _ := createUser(db, "Bea", false, []byte("bea"))
+	adminKey := newSoftKey(t)
+	cred := func(k *softKey) string {
+		data, _ := json.Marshal(webauthn.Credential{
+			ID: k.id, PublicKey: k.cose(t), AttestationType: "none",
+			Flags: webauthn.CredentialFlags{UserPresent: true, UserVerified: true},
+			Attestation: webauthn.CredentialAttestation{
+				ClientDataJSON: bytes.Repeat([]byte("x"), 20000),
+				Object:         bytes.Repeat([]byte{0xab}, 20000),
+			},
+		})
+		return string(data)
+	}
+	forged := newSoftKey(t)
+	forged.id = adminKey.id
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{"DROP INDEX IF EXISTS idx_credentials_key", nil},
+		{"INSERT INTO credentials (id, name, created_at, data, user_id) VALUES (1, 'Admin', 'z', ?, ?)", []any{cred(adminKey), admin}},
+		{"INSERT INTO credentials (id, name, created_at, data, user_id) VALUES (2, 'Kopie', 'z', ?, ?)", []any{cred(forged), bea}},
+		{"INSERT INTO sessions (token, expires_at, credential_id, hashed, user_id) VALUES ('kopie', '2999-01-01T00:00:00Z', 2, 1, ?)", []any{bea}},
+		{"INSERT INTO push_subscriptions (endpoint, p256dh, auth, origin, credential_id, created_at, user_id) " +
+			"VALUES ('https://fcm.googleapis.com/x', 'p', 'a', 'https://todo.example', 2, 'z', ?)", []any{bea}},
+	} {
+		if _, err := db.Exec(q.sql, q.args...); err != nil {
+			t.Fatalf("%s: %v", q.sql, err)
+		}
+	}
+	db.Close()
+
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatalf("openDB auf Bestands-DB: %v", err)
+	}
+	defer db.Close()
+	var rows, sessions, subs int
+	db.QueryRow("SELECT (SELECT COUNT(*) FROM credentials), (SELECT COUNT(*) FROM sessions WHERE credential_id = 2), "+
+		"(SELECT COUNT(*) FROM push_subscriptions WHERE credential_id = 2)").Scan(&rows, &sessions, &subs)
+	if rows != 1 || sessions != 0 || subs != 0 {
+		t.Fatalf("nach der Migration: %d Passkeys, %d Sitzungen und %d Geräte der Kopie", rows, sessions, subs)
+	}
+	var data string
+	var owner int64
+	if err := db.QueryRow("SELECT data, user_id FROM credentials WHERE id = 1").Scan(&data, &owner); err != nil {
+		t.Fatalf("ältester Passkey verloren: %v", err)
+	}
+	var kept webauthn.Credential
+	if err := json.Unmarshal([]byte(data), &kept); err != nil || owner != admin || !bytes.Equal(kept.PublicKey, adminKey.cose(t)) {
+		t.Fatalf("falscher Passkey behalten: owner %d, err %v", owner, err)
+	}
+	if len(data) > 2000 {
+		t.Fatalf("Attestation nicht entfernt: %d Byte", len(data))
+	}
+	if _, err := db.Exec("INSERT INTO credentials (name, created_at, data, user_id) VALUES ('nochmal', 'z', ?, ?)", cred(forged), bea); err == nil {
+		t.Fatal("dieselbe Passkey-ID ein zweites Mal gespeichert")
+	}
+}
+
+// The unique index is built on the stored string, the cleanup used to only
+// look at rows it could decode: two broken rows with the same ID made the
+// index — and with it every start of the app — fail.
+func TestMigrationCopesWithBrokenDuplicatePasskeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "todo.db")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	for _, q := range []string{
+		"DROP INDEX IF EXISTS idx_credentials_key",
+		`INSERT INTO credentials (name, created_at, data, user_id) VALUES ('a', 'z', '{"id":"!kein base64!"}', 1)`,
+		`INSERT INTO credentials (name, created_at, data, user_id) VALUES ('b', 'z', '{"id":"!kein base64!"}', 1)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	db.Close()
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatalf("Start mit zwei kaputten Einträgen gleicher ID: %v", err)
+	}
+	defer db.Close()
+	var n int
+	db.QueryRow("SELECT COUNT(*) FROM credentials").Scan(&n)
+	if n != 1 {
+		t.Fatalf("%d Einträge, erwartet 1", n)
+	}
+}
+
+// migrateTasksAutoincrement copies the columns by name: a column added to
+// tasks later has to go into tasksRebuildCols too, or the rebuild of an
+// older database drops it.
+func TestTasksRebuildCopiesEveryColumn(t *testing.T) {
+	db, err := openDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT name FROM pragma_table_info('tasks') ORDER BY name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		rows.Scan(&c)
+		cols = append(cols, c)
+	}
+	copied := strings.Split(tasksRebuildCols, ", ")
+	slices.Sort(copied)
+	if !slices.Equal(cols, copied) {
+		t.Fatalf("Spalten von tasks %v, der Umbau kopiert %v", cols, copied)
 	}
 }

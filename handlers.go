@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -37,12 +39,64 @@ const (
 )
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	// Tasks, settings (webhook token) and passkey lists have no business in
-	// the browser cache — they'd still be there after logging out.
-	w.Header().Set("Cache-Control", "no-store")
+	jsonHeader(w)
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
+}
+
+func jsonHeader(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	// Tasks, settings and passkey lists have no business in the browser
+	// cache — they'd still be there after logging out.
+	w.Header().Set("Cache-Control", "no-store")
+}
+
+// jsonStream writes a JSON response one value at a time, through a buffer
+// and an idleWriter: a long list never sits in memory as one document (for
+// the task list it used to be hundreds of MB). Without HTML escaping —
+// every "<" would otherwise take six bytes (\u003c), in memory and on the
+// wire; the responses are application/json with nosniff, never HTML.
+type jsonStream struct {
+	bw  *bufio.Writer
+	buf bytes.Buffer
+	enc *json.Encoder
+	err error // first write error: the client is gone, the rest is skipped
+}
+
+// newJSONStream: until as for idleWriter (zero: no overall deadline).
+func newJSONStream(w http.ResponseWriter, until time.Time) *jsonStream {
+	js := &jsonStream{bw: bufio.NewWriterSize(newIdleWriter(w, until), 64<<10)}
+	js.enc = json.NewEncoder(&js.buf)
+	js.enc.SetEscapeHTML(false)
+	return js
+}
+
+// raw writes JSON syntax as is (keys, brackets, commas).
+func (js *jsonStream) raw(s string) {
+	if js.err == nil {
+		_, js.err = js.bw.WriteString(s)
+	}
+}
+
+// value writes v. The status is already out by then: on an encoding error
+// the connection is aborted, so nobody keeps a broken document.
+func (js *jsonStream) value(v any) {
+	if js.err != nil {
+		return
+	}
+	js.buf.Reset()
+	if err := js.enc.Encode(v); err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	_, js.err = js.bw.Write(bytes.TrimSuffix(js.buf.Bytes(), []byte("\n")))
+}
+
+// flush sends what's buffered; the error is the first one of the stream.
+func (js *jsonStream) flush() error {
+	if js.err == nil {
+		js.err = js.bw.Flush()
+	}
+	return js.err
 }
 
 // writeError responds with {"error": "<message>"} — key is a catalog key,
@@ -246,6 +300,7 @@ type settingsResponse struct {
 
 func (s *server) settingsOf(uid int64) settingsResponse {
 	resp := settingsResponse{appSettings: s.store.get(uid)}
+	resp.WebhookURL = maskWebhook(resp.WebhookURL)
 	var admin int
 	s.db.QueryRow("SELECT id, name, is_admin FROM users WHERE id = ?", uid).Scan(&resp.Me.ID, &resp.Me.Name, &admin)
 	resp.Me.IsAdmin = admin == 1
@@ -256,23 +311,38 @@ func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.settingsOf(userID(r)))
 }
 
+// settingsReq: PUT /api/settings. The settings only show the webhook
+// masked (maskWebhook): leaving webhook_url out or sending a mask back keeps
+// the current one — also an old mask, which an old cached form sends after
+// the webhook was changed elsewhere ("…" is never part of a webhook URL).
+type settingsReq struct {
+	appSettings
+	WebhookURL *string `json:"webhook_url"`
+}
+
 func (s *server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	var req appSettings
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	var body settingsReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, r, http.StatusBadRequest, "error.bad_request")
 		return
+	}
+	uid := userID(r)
+	cur := s.store.get(uid).WebhookURL
+	req := body.appSettings
+	req.WebhookURL = cur
+	if body.WebhookURL != nil && !strings.Contains(*body.WebhookURL, "…") {
+		req.WebhookURL = *body.WebhookURL
 	}
 	if err := validateSettings(req); err != nil {
 		writeErr(w, r, http.StatusBadRequest, err)
 		return
 	}
-	uid := userID(r)
 	admin := userIsAdmin(s.db, uid)
 	// The webhook decides where task titles go — even after "sign out
 	// everywhere"; the archive period decides when everyone's completed
 	// tasks get deleted. Changing either needs a fresh login, like passkeys.
-	webhookChanged := req.WebhookURL != s.store.get(uid).WebhookURL
+	webhookChanged := req.WebhookURL != cur
 	archiveChanged := admin && req.ArchiveDays != s.store.archiveDays()
 	if (webhookChanged || archiveChanged) && !s.requireFreshAuth(w, r) {
 		return
@@ -322,9 +392,19 @@ func (s *server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// taskLoads: list loads one at a time per person (the app reloads after
+// every change, in every tab), two at a time overall — each holds the
+// person's whole visible list in memory until it's written out.
+var taskLoads = newWaitSlots(1, 2)
+
 func (s *server) handleListTasks(w http.ResponseWriter, r *http.Request) {
-	now := s.nowFor(userID(r))
 	uid := userID(r)
+	release, ok := taskLoads.acquire(r.Context(), uid)
+	if !ok {
+		return // client gone while waiting
+	}
+	defer release()
+	now := s.nowFor(uid)
 	tasks, err := listTasks(s.db, uid, now)
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
@@ -340,12 +420,24 @@ func (s *server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"tasks":   tasks,
-		"today":   now.Format(dateFmt),
-		"lists":   lists,
-		"invites": invites,
-	})
+	jsonHeader(w)
+	w.WriteHeader(http.StatusOK)
+	js := newJSONStream(w, time.Now().Add(taskListWriteMax))
+	js.raw(`{"today":`)
+	js.value(now.Format(dateFmt))
+	js.raw(`,"lists":`)
+	js.value(lists)
+	js.raw(`,"invites":`)
+	js.value(invites)
+	js.raw(`,"tasks":[`)
+	for i := range tasks {
+		if i > 0 {
+			js.raw(",")
+		}
+		js.value(&tasks[i])
+	}
+	js.raw("]}\n")
+	js.flush() // an error here only means: client gone
 }
 
 type taskReq struct {
@@ -796,9 +888,9 @@ func (s *server) handleSnoozeTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Optional: the due date the snooze is relative to (buttons on a
-	// notification, see handleCompleteTask). tasks.id gets reused after
-	// deletion — a day-old notification must not silently snooze a different,
-	// newer task.
+	// notification, see handleCompleteTask). A day-old notification must not
+	// snooze the task once more after its due date has moved on — nor, with
+	// an ID from before migrateTasksAutoincrement, a different task.
 	if req.ExpectedDueDate != "" {
 		cur := ""
 		if t.DueDate != nil {
@@ -1157,9 +1249,10 @@ func (s *server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// Same protection as snoozing (handleSnoozeTask): a notification with an
-		// old due date must not silently complete a different, newer task
-		// because tasks.id gets reused. Without expected_due_date (in-app use)
-		// no check applies, as before.
+		// old due date must not silently complete the task once its due date
+		// has moved on — nor, with an ID from before migrateTasksAutoincrement,
+		// a different task. Without expected_due_date (in-app use) no check
+		// applies, as before.
 		if req.ExpectedDueDate != "" {
 			cur := ""
 			if t.DueDate != nil {
@@ -1326,8 +1419,7 @@ func (s *server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 
 // deleteTaskCascade deletes a task along with its subtasks, links and images
 // in one transaction: if one step fails, everything stays as is. Done
-// separately, orphans would otherwise be left behind and inherited by the
-// next task with the same ID (tasks.id gets reused). Use only tx inside it —
+// separately, orphans would otherwise be left behind. Use only tx inside it —
 // with a single DB connection, any access via db would deadlock.
 func deleteTaskCascade(db *sql.DB, uid, id int64) error {
 	return deleteFamily(db, "SELECT id FROM tasks WHERE (id = ? OR parent_id = ?) AND list_id "+visibleLists, id, id, uid)

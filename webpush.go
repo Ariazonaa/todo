@@ -173,9 +173,11 @@ func encryptPushWith(as *ecdh.PrivateKey, salt, uaPublic, authSecret, plaintext 
 // into a tool for requests against arbitrary targets.
 var pushHosts = []string{"fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com", "notify.windows.com"}
 
-// pushHostAllowed is a variable so tests can allow a local service.
+// pushHostAllowed is a variable so tests can allow a local service. Only on
+// the standard port: on another one it's no push service, and the scheduler
+// would wait out the timeout there, device after device.
 var pushHostAllowed = func(u *url.URL) bool {
-	if u.Scheme != "https" {
+	if u.Scheme != "https" || (u.Port() != "" && u.Port() != "443") {
 		return false
 	}
 	for _, d := range pushHosts {

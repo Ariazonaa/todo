@@ -509,6 +509,17 @@ test('Push lässt sich auf dem Gerät ein- und ausschalten', async () => {
   await expect(schalter).toHaveAttribute('aria-checked', 'false');
   await expect(page.locator('#push-test')).toBeHidden();
 
+  // A new device needs a fresh sign-in. With an old session the app
+  // confirms first and stops there — Safari allows only one prompt per tap.
+  await page.route('**/api/auth/fresh', (route) => route.fulfill({
+    status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'alt', reauth: true }),
+  }), { times: 1 });
+  const bestaetigt = page.waitForResponse((r) => r.url().endsWith('/api/auth/reauth/finish'));
+  await schalter.click();
+  expect((await bestaetigt).status()).toBe(204);
+  await expect(page.locator('#toast')).toHaveText('Bestätigt — bitte Push nochmal einschalten');
+  await expect(schalter).toHaveAttribute('aria-checked', 'false');
+
   const an = page.waitForResponse((r) => r.url().endsWith('/api/push/subscription') && r.request().method() === 'PUT');
   await schalter.click();
   expect((await an).status()).toBe(204);

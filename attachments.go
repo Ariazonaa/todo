@@ -45,6 +45,9 @@ const (
 // multiply the limit above.
 var decodeSlot = make(chan struct{}, 1)
 
+// decodeImage is image.Decode — a variable so tests can make it fail.
+var decodeImage = image.Decode
+
 // Uploads are read into memory whole (up to maxAttachmentSize each): at most
 // two per person and six overall at a time — dozens in parallel would
 // otherwise blow through the container's memory limit.
@@ -56,6 +59,13 @@ var (
 // uploadSlotWait: how long an upload waits for a free slot before it's
 // turned away (the client retries a few times).
 const uploadSlotWait = 10 * time.Second
+
+// Originals are loaded into memory whole (up to maxAttachmentSize) and stay
+// there until the client has them: per person downloadsPerPerson at a time
+// (the lightbox shows one), eight overall.
+const downloadsPerPerson = 2
+
+var downloads = newWaitSlots(downloadsPerPerson, 8)
 
 // checkImageDimensions reads only the header and rejects oversized images
 // before anything gets decoded (and thus allocated).
@@ -87,7 +97,7 @@ func makeThumbInSlot(data []byte) ([]byte, error) {
 	if err := checkImageDimensions(data); err != nil {
 		return nil, err
 	}
-	src, _, err := image.Decode(bytes.NewReader(data))
+	src, _, err := decodeImage(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -282,8 +292,8 @@ func (s *server) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) 
 	}
 	thumb, _ := makeThumb(data) // error ok: /thumb then serves the original
 	// The task may have been deleted during the upload (seconds, for
-	// 15 MB). Without the check in the INSERT itself, the image would end
-	// up on whichever task gets the same ID next — tasks.id is reused.
+	// 15 MB). Without the check in the INSERT itself, the image would be
+	// left behind as an orphan.
 	res, err := s.db.Exec("INSERT INTO attachments (task_id, mime, created_at, data, thumb) "+
 		"SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND list_id "+visibleLists+")",
 		t.ID, mime, time.Now().UTC().Format(time.RFC3339), data, thumb, t.ID, uid)
@@ -322,18 +332,31 @@ func (s *server) handleAttachmentGet(w http.ResponseWriter, r *http.Request) {
 	if notModified(w, r, fmt.Sprintf(`"a%d"`, id)) {
 		return
 	}
+	s.serveOriginal(w, r, id, taskID)
+}
+
+// serveOriginal writes an image's original: once a download slot is free,
+// and in chunks with a deadline each (idleWriter) — a client that stops
+// reading lets go of its up to 15 MB after writeIdle.
+func (s *server) serveOriginal(w http.ResponseWriter, r *http.Request, id, taskID int64) {
+	release, ok := downloads.acquire(r.Context(), userID(r))
+	if !ok {
+		return // client gone while waiting
+	}
+	defer release()
 	var mime string
 	var data []byte
 	// task_id here too: between the check and the load, the image and its
 	// task may have been deleted and the ID reassigned.
-	err = s.db.QueryRow("SELECT mime, data FROM attachments WHERE id = ? AND task_id = ? "+
+	err := s.db.QueryRow("SELECT mime, data FROM attachments WHERE id = ? AND task_id = ? "+
 		"AND task_id IN (SELECT id FROM tasks WHERE list_id "+visibleLists+")", id, taskID, userID(r)).Scan(&mime, &data)
 	if err != nil {
 		writeError(w, r, http.StatusNotFound, "error.image_not_found")
 		return
 	}
 	serveMime(w, mime)
-	w.Write(data)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	newIdleWriter(w, time.Time{}).Write(data) // an error only means: client gone or stalled
 }
 
 // handleAttachmentThumb serves the small preview; for existing images
@@ -356,32 +379,54 @@ func (s *server) handleAttachmentThumb(w http.ResponseWriter, r *http.Request) {
 	if notModified(w, r, fmt.Sprintf(`"t%d"`, id)) {
 		return
 	}
-	var mime string
-	var thumb, data []byte
-	if err := s.db.QueryRow("SELECT mime, thumb FROM attachments WHERE id = ? AND task_id = ? "+
-		"AND task_id IN (SELECT id FROM tasks WHERE list_id "+visibleLists+")", id, taskID, userID(r)).Scan(&mime, &thumb); err != nil {
+	var thumb []byte
+	if err := s.db.QueryRow("SELECT thumb FROM attachments WHERE id = ? AND task_id = ? "+
+		"AND task_id IN (SELECT id FROM tasks WHERE list_id "+visibleLists+")", id, taskID, userID(r)).Scan(&thumb); err != nil {
 		writeError(w, r, http.StatusNotFound, "error.image_not_found")
 		return
 	}
-	// The original (up to 15 MB) only when there's no thumbnail yet — the list
-	// fetches every thumbnail at once.
 	if thumb == nil {
-		if err := s.db.QueryRow("SELECT data FROM attachments WHERE id = ?", id).Scan(&data); err != nil {
-			writeError(w, r, http.StatusNotFound, "error.image_not_found")
+		// No thumbnail yet: decode the original, one at a time (decodeSlot) —
+		// the list fetches every thumbnail at once. The slot comes before the
+		// original (up to 15 MB) is loaded: waiting requests hold nothing, and
+		// stop waiting once their client is gone.
+		select {
+		case decodeSlot <- struct{}{}:
+		case <-r.Context().Done():
 			return
 		}
-		if t, err := makeThumb(data); err == nil {
-			thumb = t
-			s.db.Exec("UPDATE attachments SET thumb = ? WHERE id = ?", t, id)
-		}
+		thumb = func() []byte {
+			// Released even if a decoder panics — every upload waits for the slot.
+			defer func() { <-decodeSlot }()
+			return s.backfillThumb(id)
+		}()
 	}
-	if thumb != nil {
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write(thumb)
+	if thumb == nil {
+		// Can't be decoded (e.g. above maxImagePixels): the original instead.
+		s.serveOriginal(w, r, id, taskID)
 		return
 	}
-	serveMime(w, mime)
-	w.Write(data)
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Write(thumb)
+}
+
+// backfillThumb creates and stores the thumbnail of image id; the caller
+// holds decodeSlot. nil: the image can't be decoded (or is gone).
+func (s *server) backfillThumb(id int64) []byte {
+	var thumb, data []byte
+	// Another request may have made it while this one waited.
+	if err := s.db.QueryRow("SELECT thumb FROM attachments WHERE id = ?", id).Scan(&thumb); err != nil || thumb != nil {
+		return thumb
+	}
+	if err := s.db.QueryRow("SELECT data FROM attachments WHERE id = ?", id).Scan(&data); err != nil {
+		return nil
+	}
+	t, err := makeThumbInSlot(data)
+	if err != nil {
+		return nil
+	}
+	s.db.Exec("UPDATE attachments SET thumb = ? WHERE id = ?", t, id)
+	return t
 }
 
 func (s *server) handleAttachmentDelete(w http.ResponseWriter, r *http.Request) {

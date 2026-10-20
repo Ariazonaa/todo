@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,10 @@ const (
 	// and delete the owner's: a permanent takeover
 	// that not even "sign out everywhere" would fix.
 	reauthWindow = 10 * time.Minute
+	// maxPasskeysPerUser: every login parses the passkeys of the whole
+	// instance (login/begin offers all of them) — one account mustn't be
+	// able to inflate that at will.
+	maxPasskeysPerUser = 20
 )
 
 // wanUser: an account for go-webauthn. id is the user handle carried by
@@ -627,11 +632,6 @@ func (s *server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	data, err := json.Marshal(cred)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
 	// Guards in the same transaction as the write — the transaction holds
 	// the single DB connection, so no second setup can write in between.
 	// First account: no account yet. Recovery: the admin from begin, still
@@ -668,7 +668,7 @@ func (s *server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 				return 0, 0, errSetupDone
 			}
 		}
-		credRow, err := insertCredential(tx, uid, credName(r), string(data))
+		credRow, err := insertCredential(tx, uid, credName(r), cred)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -679,7 +679,7 @@ func (s *server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		writeCredentialErr(w, r, err)
 		return
 	}
 	if err := s.prepareSetupCode(); err != nil {
@@ -706,11 +706,6 @@ func (s *server) finishSetupWithCode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	data, err := json.Marshal(cred)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
 	credRow, err := func() (int64, error) {
 		tx, err := s.db.Begin()
 		if err != nil {
@@ -725,7 +720,7 @@ func (s *server) finishSetupWithCode(w http.ResponseWriter, r *http.Request) {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return 0, errSetupDone // code consumed or expired in the meantime
 		}
-		credRow, err := insertCredential(tx, uid, credName(r), string(data))
+		credRow, err := insertCredential(tx, uid, credName(r), cred)
 		if err != nil {
 			return 0, err
 		}
@@ -736,7 +731,7 @@ func (s *server) finishSetupWithCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		writeCredentialErr(w, r, err)
 		return
 	}
 	if err := s.replaceSession(w, r, credRow, uid); err != nil {
@@ -752,6 +747,16 @@ func (s *server) finishSetupWithCode(w http.ResponseWriter, r *http.Request) {
 // firmly to this exact begin, and the registration itself may take longer.
 func (s *server) handlePasskeyBegin(w http.ResponseWriter, r *http.Request) {
 	if !s.requireFreshAuth(w, r) {
+		return
+	}
+	// Already here, not only in finish (insertCredential): by then the
+	// authenticator has created the passkey, and it would stay behind in the
+	// password manager as a dead entry.
+	if n, err := countCredentials(s.db, userID(r)); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
+	} else if n >= maxPasskeysPerUser {
+		writeError(w, r, http.StatusConflict, "error.passkey_limit", "n", maxPasskeysPerUser)
 		return
 	}
 	wd, err := loadWanUser(s.db, userID(r))
@@ -772,16 +777,23 @@ func (s *server) handlePasskeyFinish(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	data, err := json.Marshal(cred)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
-		return
-	}
-	if _, err := insertCredential(s.db, userID(r), credName(r), string(data)); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "error.internal")
+	if _, err := insertCredential(s.db, userID(r), credName(r), cred); err != nil {
+		writeCredentialErr(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeCredentialErr answers a failed insertCredential.
+func writeCredentialErr(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, errPasskeyTaken):
+		writeError(w, r, http.StatusConflict, "error.passkey_taken")
+	case errors.Is(err, errPasskeyLimit):
+		writeError(w, r, http.StatusConflict, "error.passkey_limit", "n", maxPasskeysPerUser)
+	default:
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+	}
 }
 
 func (s *server) handlePasskeyList(w http.ResponseWriter, r *http.Request) {
@@ -895,4 +907,25 @@ func (s *server) finishRegistration(w http.ResponseWriter, r *http.Request, kind
 		return nil, nil, false
 	}
 	return cred, user.id, true
+}
+
+// storableCredential: what of a registration is worth keeping — the key,
+// its flags and counter. The attestation (client data, authenticator data,
+// statement) would only matter for checks against a metadata service, which
+// this app doesn't use, and it's whatever the client chose to send, up to
+// the request limit — while every login parses all stored passkeys of the
+// instance. Of the transports, only those WebAuthn defines.
+func storableCredential(c webauthn.Credential) webauthn.Credential {
+	c.Attestation = webauthn.CredentialAttestation{}
+	var known []protocol.AuthenticatorTransport
+	for _, tr := range c.Transport {
+		switch tr {
+		case protocol.USB, protocol.NFC, protocol.BLE, protocol.SmartCard, protocol.Hybrid, protocol.Internal:
+			if !slices.Contains(known, tr) {
+				known = append(known, tr)
+			}
+		}
+	}
+	c.Transport = known
+	return c
 }

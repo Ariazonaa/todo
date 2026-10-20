@@ -283,9 +283,10 @@ func TestPushAllNotDeliveredOn5xx(t *testing.T) {
 	}
 }
 
-// pushReq is a request from the "tok" session with the app's origin.
+// pushReq is a request from the "tok" session with the app's origin, just
+// signed in (a new device needs that, see TestNewPushDeviceNeedsFreshAuth).
 func pushReq(s *server, method, body string) *http.Request {
-	req := withUser(httptest.NewRequest(method, "/api/push/subscription", strings.NewReader(body)), testUID)
+	req := freshUser(httptest.NewRequest(method, "/api/push/subscription", strings.NewReader(body)), testUID)
 	req.Header.Set("Origin", "https://todo.example")
 	req.AddCookie(&http.Cookie{Name: s.cookieName(sessionCookie), Value: "tok"})
 	return req
@@ -752,5 +753,63 @@ func TestPushTestFollowsRequestLanguage(t *testing.T) {
 	}
 	if got := st.received(); len(got) != 1 || got[0].Body != "🔔 Test notification" {
 		t.Fatalf("%+v", got)
+	}
+}
+
+// A device registered with a stolen session cookie would get task titles
+// for good — it outlives the session and shows up nowhere. A new device
+// therefore needs a fresh login. Refreshing a known one doesn't (healPush
+// on every start), nor does replacing one of the account's own devices
+// when the browser renews its subscription (pushsubscriptionchange).
+func TestNewPushDeviceNeedsFreshAuth(t *testing.T) {
+	s := testServer(t)
+	st := newPushStub(t)
+	keys := fmt.Sprintf(`"keys":{"p256dh":%q,"auth":%q}`, b64.EncodeToString(st.ua.PublicKey().Bytes()), b64.EncodeToString(st.secret))
+	body := func(path, old string) string {
+		if old == "" {
+			return fmt.Sprintf(`{"endpoint":%q,%s}`, st.endpoint(path), keys)
+		}
+		return fmt.Sprintf(`{"endpoint":%q,"old_endpoint":%q,%s}`, st.endpoint(path), st.endpoint(old), keys)
+	}
+	stale := func(b string) int {
+		return serveAuthed(s, s.handlePushSubscribe, staleRequest(t, s, testUID, "PUT", b)).Code
+	}
+	devices := func() []string {
+		subs, err := listPushSubs(s.db, testUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var eps []string
+		for _, sub := range subs {
+			eps = append(eps, strings.TrimPrefix(sub.Endpoint, st.srv.URL))
+		}
+		return eps
+	}
+
+	if code := stale(body("/neu", "")); code != http.StatusForbidden {
+		t.Fatalf("neues Gerät mit alter Sitzung: %d, erwartet 403", code)
+	}
+	if got := devices(); len(got) != 0 {
+		t.Fatalf("Gerät trotz 403 registriert: %v", got)
+	}
+	if rec := callAs(t, testUID, s.handlePushSubscribe, "PUT", "/", strings.NewReader(body("/neu", ""))); rec.Code != http.StatusNoContent {
+		t.Fatalf("neues Gerät frisch angemeldet: %d %s", rec.Code, rec.Body)
+	}
+	if code := stale(body("/neu", "")); code != http.StatusNoContent {
+		t.Fatalf("bekanntes Gerät auffrischen: %d, erwartet 204", code)
+	}
+	if code := stale(body("/erneuert", "/neu")); code != http.StatusNoContent {
+		t.Fatalf("erneuerte Subscription des eigenen Geräts: %d, erwartet 204", code)
+	}
+	if got := devices(); len(got) != 1 || got[0] != "/erneuert" {
+		t.Fatalf("Geräte nach der Erneuerung: %v, erwartet nur /erneuert", got)
+	}
+	// Someone else's device doesn't count as the predecessor
+	bea := mustUser(t, s, "Bea")
+	if err := savePushSub(s.db, st.endpoint("/bea"), st.ua.PublicKey().Bytes(), st.secret, "https://todo.example", 0, bea); err != nil {
+		t.Fatal(err)
+	}
+	if code := stale(body("/dieb", "/bea")); code != http.StatusForbidden {
+		t.Fatalf("fremdes Gerät als Vorgänger: %d, erwartet 403", code)
 	}
 }

@@ -21,6 +21,10 @@ type pushSub struct {
 	Origin   string
 }
 
+// maxPushDevicesPerUser: every notification goes to every device, one
+// after the other in the scheduler's tick for all accounts.
+const maxPushDevicesPerUser = 10
+
 const pushSubCols = "id, endpoint, p256dh, auth, origin"
 
 func scanPushSub(row interface{ Scan(...any) error }) (pushSub, error) {
@@ -41,29 +45,41 @@ func scanPushSub(row interface{ Scan(...any) error }) (pushSub, error) {
 // doesn't carry that device's keys.
 var errPushTaken = errors.New("push: endpoint registered to another account")
 
+// errPushLimit: the account already has maxPushDevicesPerUser devices.
+var errPushLimit = errors.New("push: device limit reached")
+
 // savePushSub registers a device for uid or updates it (reload,
 // self-healing, new passkey) — one endpoint, one row. If the same device
 // registers under a different person — a shared tablet — it belongs to that
 // person afterward. But only with the same keys: the browser keeps them for
 // its subscription, whereas someone who merely learned the endpoint doesn't
 // know the auth secret — and could otherwise unhook another person's device.
+//
+// A device that isn't uid's yet only gets in below maxPushDevicesPerUser —
+// within the INSERT itself.
 func savePushSub(db *sql.DB, endpoint string, p256dh, auth []byte, origin string, credentialID, uid int64) error {
 	var cred any
 	if credentialID > 0 {
 		cred = credentialID
 	}
+	const mine = "EXISTS (SELECT 1 FROM push_subscriptions WHERE endpoint = ? AND user_id = ?)"
+	const room = "(SELECT COUNT(*) FROM push_subscriptions WHERE user_id = ?) < ?"
 	res, err := db.Exec(`INSERT INTO push_subscriptions (endpoint, p256dh, auth, origin, credential_id, created_at, user_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ?, ? WHERE `+mine+` OR `+room+`
 		ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth,
 			origin = excluded.origin, credential_id = excluded.credential_id, user_id = excluded.user_id
 		WHERE push_subscriptions.user_id IS excluded.user_id
 			OR (push_subscriptions.p256dh = excluded.p256dh AND push_subscriptions.auth = excluded.auth)`,
 		endpoint, b64.EncodeToString(p256dh), b64.EncodeToString(auth), origin, cred,
-		time.Now().UTC().Format(time.RFC3339), uid)
+		time.Now().UTC().Format(time.RFC3339), uid, endpoint, uid, uid, maxPushDevicesPerUser)
 	if err != nil {
 		return err
 	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		var full bool
+		if err := db.QueryRow("SELECT NOT "+mine+" AND NOT "+room, endpoint, uid, uid, maxPushDevicesPerUser).Scan(&full); err == nil && full {
+			return errPushLimit
+		}
 		return errPushTaken
 	}
 	return nil
@@ -146,10 +162,13 @@ func (s *server) handlePushKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"public_key": s.vapid.publicKey()})
 }
 
-// pushSubReq is PushSubscription.toJSON() from the browser.
+// pushSubReq is PushSubscription.toJSON() from the browser. OldEndpoint:
+// the subscription this one replaces (the browser renewed it, or the
+// server key changed).
 type pushSubReq struct {
-	Endpoint string `json:"endpoint"`
-	Keys     struct {
+	Endpoint    string `json:"endpoint"`
+	OldEndpoint string `json:"old_endpoint"`
+	Keys        struct {
 		P256dh string `json:"p256dh"`
 		Auth   string `json:"auth"`
 	} `json:"keys"`
@@ -194,15 +213,44 @@ func (s *server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	if u, err := url.Parse(origin); err != nil || u.Scheme != "https" || u.Host == "" {
 		origin = "https://" + r.Host
 	}
+	// A device registered with a stolen session cookie would get task
+	// titles for good: it outlives the session and shows up nowhere. So a
+	// new device needs a fresh login — refreshing one of the account's own
+	// (healPush on every start) or replacing it with its renewed
+	// subscription doesn't. Endpoints are secret, the thief knows none.
+	uid := userID(r)
+	if !pushDeviceKnown(s.db, uid, req.Endpoint, req.OldEndpoint) && !s.requireFreshAuth(w, r) {
+		return
+	}
+	// The browser has given up the old subscription: it goes first, so the
+	// successor doesn't count against the device limit.
+	if req.OldEndpoint != "" && req.OldEndpoint != req.Endpoint {
+		if err := deletePushSubOf(s.db, uid, req.OldEndpoint); err != nil {
+			writeError(w, r, http.StatusInternalServerError, "error.internal")
+			return
+		}
+	}
 	cred := sessionCredential(s.db, s.sessionToken(r))
-	if err := savePushSub(s.db, req.Endpoint, p256dh, auth, origin, cred, userID(r)); errors.Is(err, errPushTaken) {
+	switch err := savePushSub(s.db, req.Endpoint, p256dh, auth, origin, cred, uid); {
+	case errors.Is(err, errPushTaken):
 		writeError(w, r, http.StatusConflict, "error.push_taken")
 		return
-	} else if err != nil {
+	case errors.Is(err, errPushLimit):
+		writeError(w, r, http.StatusConflict, "error.push_limit", "n", maxPushDevicesPerUser)
+		return
+	case err != nil:
 		writeError(w, r, http.StatusInternalServerError, "error.internal")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// pushDeviceKnown: endpoint or old (the subscription it replaces) is
+// already one of uid's devices.
+func pushDeviceKnown(db *sql.DB, uid int64, endpoint, old string) bool {
+	var ok bool
+	return db.QueryRow("SELECT EXISTS (SELECT 1 FROM push_subscriptions WHERE user_id = ? AND endpoint IN (?, ?))",
+		uid, endpoint, old).Scan(&ok) == nil && ok
 }
 
 func (s *server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {

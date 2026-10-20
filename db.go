@@ -4,19 +4,27 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/go-webauthn/webauthn/webauthn"
 	_ "modernc.org/sqlite"
 )
 
+// tasks: AUTOINCREMENT, like attachments — without it SQLite hands out the
+// highest deleted ID again, and whatever still pointed at the deleted task
+// (an undo-delete sent late, a notification's "Done", the auto-archive)
+// hit the next new one: in a shared list, someone else's.
+// migrateTasksAutoincrement retrofits it.
 const schema = `
 CREATE TABLE IF NOT EXISTS tasks (
-	id           INTEGER PRIMARY KEY,
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
 	title        TEXT NOT NULL,
 	due_date     TEXT,
 	due_time     TEXT,
@@ -81,9 +89,6 @@ CREATE TABLE IF NOT EXISTS task_reminders (
 	PRIMARY KEY (task_id, user_id, channel)
 );
 CREATE INDEX IF NOT EXISTS idx_task_reminders_user ON task_reminders(user_id);
--- tasks.id is reused: stamps go away with the task.
-CREATE TRIGGER IF NOT EXISTS tasks_reminders_cleanup AFTER DELETE ON tasks
-	BEGIN DELETE FROM task_reminders WHERE task_id = OLD.id; END;
 CREATE TABLE IF NOT EXISTS stats (
 	user_id INTEGER NOT NULL,
 	date    TEXT NOT NULL,
@@ -120,6 +125,18 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 	user_id       INTEGER
 );
 `
+
+// tasksRemindersTrigger: stamps go away with their task.
+const tasksRemindersTrigger = `
+CREATE TRIGGER IF NOT EXISTS tasks_reminders_cleanup AFTER DELETE ON tasks
+	BEGIN DELETE FROM task_reminders WHERE task_id = OLD.id; END;
+`
+
+// tasksDefaultListTrigger: safety net — a task without a list lands in the
+// admin's default list (the oldest one); all write paths set list_id
+// themselves.
+const tasksDefaultListTrigger = "CREATE TRIGGER tasks_default_list AFTER INSERT ON tasks WHEN NEW.list_id IS NULL " +
+	"BEGIN UPDATE tasks SET list_id = (SELECT id FROM lists WHERE is_default = 1 ORDER BY id LIMIT 1) WHERE id = NEW.id; END"
 
 // attachmentsTable: AUTOINCREMENT is mandatory, not cosmetic. Without it,
 // SQLite reassigns the highest deleted rowid — "delete the wrong image,
@@ -223,7 +240,7 @@ func openDB(path string) (*sql.DB, error) {
 			}
 		}
 	}
-	for _, stmt := range []string{schema, attachmentsTable, importAttachmentsTable, attachmentsTrigger} {
+	for _, stmt := range []string{schema, tasksRemindersTrigger, attachmentsTable, importAttachmentsTable, attachmentsTrigger} {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()
 			return nil, err
@@ -343,8 +360,7 @@ func migrate(db *sql.DB) error {
 		{"UPDATE tasks SET list_id = (SELECT id FROM lists WHERE is_default = 1 ORDER BY id LIMIT 1) " +
 			"WHERE (list_id IS NULL OR list_id NOT IN (SELECT id FROM lists)) AND EXISTS (SELECT 1 FROM lists WHERE is_default = 1)", nil},
 		{"DROP TRIGGER IF EXISTS tasks_default_list", nil},
-		{"CREATE TRIGGER tasks_default_list AFTER INSERT ON tasks WHEN NEW.list_id IS NULL " +
-			"BEGIN UPDATE tasks SET list_id = (SELECT id FROM lists WHERE is_default = 1 ORDER BY id LIMIT 1) WHERE id = NEW.id; END", nil},
+		{tasksDefaultListTrigger, nil},
 		// Who may see which list — the single place for visibility: owner and
 		// members who accepted the invitation.
 		{"DROP VIEW IF EXISTS list_access", nil},
@@ -420,8 +436,16 @@ func migrate(db *sql.DB) error {
 	if err := migrateSessionHashes(db); err != nil {
 		return err
 	}
+	// Before idx_credentials_key: it fails on IDs stored twice.
+	if err := migrateCredentials(db); err != nil {
+		return err
+	}
 	// Must run after the thumb column: the rebuild copies it along.
 	if err := migrateAttachmentsAutoincrement(db); err != nil {
+		return err
+	}
+	// After every column migration of tasks: the rebuild copies them all.
+	if err := migrateTasksAutoincrement(db); err != nil {
 		return err
 	}
 	// After the attachments rebuild: rebuilding a table discards its indexes.
@@ -434,6 +458,7 @@ func migrate(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_lists_owner ON lists(owner_id)",
 		"CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
 		"CREATE INDEX IF NOT EXISTS idx_credentials_user ON credentials(user_id)",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_credentials_key ON credentials" + credentialKey,
 		"CREATE INDEX IF NOT EXISTS idx_links_b ON links(b)",
 		"CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id)",
 	} {
@@ -493,6 +518,87 @@ func migrateSessionHashes(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// migrateCredentials prepares the passkeys for the unique index on their ID.
+// A row under an ID that an older row already has was registered before the
+// index (insertCredential) and took the passkey over: it goes, along with
+// its sessions and devices — the oldest row is the original. What remains
+// is slimmed down to storableCredential. Rows that don't parse stay as they
+// are (loadCreds skips them), unless they repeat a key.
+func migrateCredentials(db *sql.DB) error {
+	rows, err := db.Query("SELECT id, data, " + credentialKey + " FROM credentials ORDER BY id")
+	if err != nil {
+		return err
+	}
+	type slimmed struct {
+		id   int64
+		data string
+	}
+	// A copy by the index's key (the stored string — rows that don't parse
+	// too, or the index can't be built and the app doesn't start) or by the
+	// decoded ID (what login compares).
+	seenKey, seenID := map[string]bool{}, map[string]bool{}
+	var copies []int64
+	var slim []slimmed
+	for rows.Next() {
+		var id int64
+		var data string
+		var key sql.NullString
+		if err := rows.Scan(&id, &data, &key); err != nil {
+			rows.Close()
+			return err
+		}
+		if key.Valid && seenKey[key.String] {
+			copies = append(copies, id)
+			continue
+		}
+		if key.Valid {
+			seenKey[key.String] = true
+		}
+		var c webauthn.Credential
+		if json.Unmarshal([]byte(data), &c) != nil {
+			continue
+		}
+		if seenID[string(c.ID)] {
+			copies = append(copies, id)
+			continue
+		}
+		seenID[string(c.ID)] = true
+		if out, err := json.Marshal(storableCredential(c)); err == nil && string(out) != data {
+			slim = append(slim, slimmed{id, string(out)})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(copies) == 0 && len(slim) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range copies {
+		log.Printf("passkey %d: same ID as an older passkey — removed", id)
+		for _, q := range []string{
+			"DELETE FROM credentials WHERE id = ?",
+			"DELETE FROM sessions WHERE credential_id = ?",
+			"DELETE FROM push_subscriptions WHERE credential_id = ?",
+		} {
+			if _, err := tx.Exec(q, id); err != nil {
+				return err
+			}
+		}
+	}
+	for _, s := range slim {
+		if _, err := tx.Exec("UPDATE credentials SET data = ? WHERE id = ?", s.data, s.id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // migrateAttachmentsAutoincrement rebuilds the attachments table once, so
 // that deleted IDs never get reassigned (see attachmentsTable). AUTOINCREMENT
 // cannot be retrofitted via ALTER TABLE.
@@ -530,6 +636,66 @@ func migrateAttachmentsAutoincrement(db *sql.DB) error {
 	} {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("attachments migration (%.40s…): %w", stmt, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// tasksRebuildCols: every column of tasks, for migrateTasksAutoincrement —
+// a new column belongs here too (TestTasksRebuildCopiesEveryColumn).
+const tasksRebuildCols = "id, title, due_date, due_time, recurrence, done, created_at, completed_at, reminded_at, parent_id, " +
+	"note, pinned, sort_order, in_progress, priority, list_id, completed_by, push_reminded_at"
+
+// migrateTasksAutoincrement rebuilds the tasks table once with AUTOINCREMENT
+// (see schema). DROP TABLE takes the triggers on tasks along — they're
+// recreated; the indexes come afterwards in migrate.
+func migrateTasksAutoincrement(db *sql.DB) error {
+	var ddl string
+	if err := db.QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").Scan(&ddl); err != nil {
+		return err
+	}
+	if strings.Contains(strings.ToUpper(ddl), "AUTOINCREMENT") {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`CREATE TABLE tasks_new (
+			id               INTEGER PRIMARY KEY AUTOINCREMENT,
+			title            TEXT NOT NULL,
+			due_date         TEXT,
+			due_time         TEXT,
+			recurrence       TEXT NOT NULL DEFAULT '',
+			done             INTEGER NOT NULL DEFAULT 0,
+			created_at       TEXT NOT NULL,
+			completed_at     TEXT,
+			reminded_at      TEXT,
+			parent_id        INTEGER,
+			note             TEXT NOT NULL DEFAULT '',
+			pinned           INTEGER NOT NULL DEFAULT 0,
+			sort_order       INTEGER NOT NULL DEFAULT 0,
+			in_progress      INTEGER NOT NULL DEFAULT 0,
+			priority         INTEGER NOT NULL DEFAULT 0 CHECK (priority BETWEEN 0 AND 3),
+			list_id          INTEGER,
+			completed_by     INTEGER,
+			push_reminded_at TEXT
+		)`,
+		// Explicit IDs pull sqlite_sequence up to max(id): new tasks start above.
+		"INSERT INTO tasks_new (" + tasksRebuildCols + ") SELECT " + tasksRebuildCols + " FROM tasks",
+		"DROP TABLE tasks",
+		"ALTER TABLE tasks_new RENAME TO tasks",
+		// The table doesn't know IDs deleted just before the upgrade (above
+		// the highest left): a margin, so they don't come back either.
+		"UPDATE sqlite_sequence SET seq = seq + 1000 WHERE name = 'tasks'",
+		tasksRemindersTrigger,
+		tasksDefaultListTrigger,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("tasks migration (%.40s…): %w", stmt, err)
 		}
 	}
 	return tx.Commit()
@@ -676,6 +842,25 @@ var errTaskLimit = errors.New("task limit reached")
 // the list given by the SQL expression list.
 func ownerTaskCount(list string) string {
 	return "(SELECT COUNT(*) FROM tasks WHERE list_id IN (SELECT id FROM lists WHERE owner_id = (SELECT owner_id FROM lists WHERE id = " + list + ")))"
+}
+
+// warnOverTaskLimit logs owners with more tasks than maxTasksPerOwner (it
+// used to be ten times higher): they can't add any until some are gone.
+func warnOverTaskLimit(db *sql.DB) {
+	rows, err := db.Query("SELECT l.owner_id, COUNT(*) FROM tasks t JOIN lists l ON l.id = t.list_id "+
+		"GROUP BY l.owner_id HAVING COUNT(*) > ?", maxTasksPerOwner)
+	if err != nil {
+		log.Printf("task limit check: %v", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var owner, n int64
+		if rows.Scan(&owner, &n) == nil {
+			log.Printf("account %d has %d tasks, more than the limit of %d: new ones are refused until some are deleted or archived",
+				owner, n, maxTasksPerOwner)
+		}
+	}
 }
 
 func createTask(db *sql.DB, uid int64, title string, dueDate, dueTime *string, recurrence, note string, pinned bool, priority int, listID, parentID *int64) (Task, error) {
@@ -848,9 +1033,8 @@ const visibleLinks = "(SELECT COUNT(*) FROM links WHERE (a = ? AND +b IN (" + vi
 func linkTasks(db *sql.DB, uid, a, b int64) error {
 	a, b = normalizePair(a, b)
 	// Only if both tasks still exist and are visible to uid at write time: a
-	// link to a task deleted concurrently would otherwise be inherited by the
-	// next new task — tasks.id gets reused. The limit is part of the write
-	// too.
+	// link to a task deleted concurrently would otherwise be left behind as an
+	// orphan. The limit is part of the write too.
 	const both = "(SELECT COUNT(*) FROM tasks WHERE id IN (?, ?) AND list_id " + visibleLists + ") = 2"
 	res, err := db.Exec("INSERT OR IGNORE INTO links (a, b) SELECT ?, ? WHERE "+both+
 		" AND "+visibleLinks+" < ? AND "+visibleLinks+" < ?",
@@ -1079,11 +1263,47 @@ func countCredentials(db *sql.DB, uid int64) (int, error) {
 	return n, err
 }
 
-func insertCredential(db execer, uid int64, name, data string) (int64, error) {
-	res, err := db.Exec("INSERT INTO credentials (name, created_at, data, user_id) VALUES (?, ?, ?, ?)",
-		name, time.Now().UTC().Format(time.RFC3339), data, uid)
+// credentialKey: SQL for a stored passkey's ID (base64, as encoding/json
+// writes []byte), NULL for a row that isn't valid JSON. The unique index
+// idx_credentials_key is built on exactly this expression.
+const credentialKey = "(CASE WHEN json_valid(data) THEN json_extract(data, '$.id') END)"
+
+var (
+	// errPasskeyTaken: a passkey with this ID is already stored (in any
+	// account). Login finds the account by the ID — a second row under the
+	// same ID took the passkey over from its owner.
+	errPasskeyTaken = errors.New("passkey ID already registered")
+	// errPasskeyLimit: the account already has maxPasskeysPerUser passkeys.
+	errPasskeyLimit = errors.New("passkey limit reached")
+)
+
+// insertCredential stores cred for uid (only storableCredential of it).
+// Uniqueness and the limit are part of the INSERT itself; the unique index
+// backs the former.
+func insertCredential(db dbtx, uid int64, name string, cred *webauthn.Credential) (int64, error) {
+	raw, err := json.Marshal(storableCredential(*cred))
 	if err != nil {
 		return 0, err
+	}
+	data := string(raw)
+	const taken = "EXISTS (SELECT 1 FROM credentials WHERE " + credentialKey + " = json_extract(?, '$.id'))"
+	res, err := db.Exec("INSERT INTO credentials (name, created_at, data, user_id) SELECT ?, ?, ?, ? "+
+		"WHERE NOT "+taken+" AND (SELECT COUNT(*) FROM credentials WHERE user_id = ?) < ?",
+		name, time.Now().UTC().Format(time.RFC3339), data, uid, data, uid, maxPasskeysPerUser)
+	if err != nil {
+		return 0, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return 0, err
+	} else if n == 0 {
+		var exists bool
+		if err := db.QueryRow("SELECT "+taken, data).Scan(&exists); err != nil {
+			return 0, err
+		}
+		if exists {
+			return 0, errPasskeyTaken
+		}
+		return 0, errPasskeyLimit
 	}
 	return res.LastInsertId()
 }

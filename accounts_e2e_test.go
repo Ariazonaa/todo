@@ -148,6 +148,63 @@ func TestRecoveryGivesAdminBack(t *testing.T) {
 	}
 }
 
+// A passkey ID belongs to exactly one passkey: login finds the account by
+// it. Anyone can read the IDs from login/begin — when Bea registered her
+// own key under the admin's ID, the newer row won and the admin was locked
+// out for good.
+func TestPasskeyIDCannotBeTakenOver(t *testing.T) {
+	s, _ := e2eSetup(t)
+	adminKey := newSoftKey(t)
+	adminKey.store(t, s, true)
+	bea := mustUser(t, s, "Bea")
+	beaKey := newSoftKey(t)
+	beaKey.storeFor(t, s, bea, true)
+	b := newBrowser(s)
+	if rec := b.login(t, beaKey, flagUP|flagUV); rec.Code != http.StatusNoContent {
+		t.Fatalf("Login Bea: %d %s", rec.Code, rec.Body)
+	}
+
+	forged := newSoftKey(t)
+	forged.id = adminKey.id
+	if rec := b.addPasskey(t, forged); rec.Code != http.StatusConflict {
+		t.Fatalf("Passkey mit der ID des Admins: %d, erwartet 409", rec.Code)
+	}
+	if n, _ := countCredentials(s.db, bea); n != 1 {
+		t.Fatalf("Bea hat %d Passkeys, erwartet 1", n)
+	}
+	admin := newBrowser(s)
+	if rec := admin.login(t, adminKey, flagUP|flagUV); rec.Code != http.StatusNoContent {
+		t.Fatalf("Admin ausgesperrt: %d %s", rec.Code, rec.Body)
+	}
+	if uid, _, ok := sessionUserOf(t, s, admin); !ok || uid != testUID {
+		t.Fatalf("Sitzung gehört %d, erwartet den Admin", uid)
+	}
+}
+
+// The same through /setup: a new account mustn't take an existing ID
+// either — and the refused attempt leaves the code usable.
+func TestSetupCannotTakeExistingPasskeyID(t *testing.T) {
+	s, _ := e2eSetup(t)
+	adminKey := newSoftKey(t)
+	adminKey.store(t, s, true)
+	bea := mustUser(t, s, "Bea")
+	code, err := setUserCode(s.db, bea)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := newSoftKey(t)
+	forged.id = adminKey.id
+	if rec := newBrowser(s).setup(t, forged, code); rec.Code != http.StatusConflict {
+		t.Fatalf("Setup mit der ID des Admins: %d, erwartet 409", rec.Code)
+	}
+	if rec := newBrowser(s).setup(t, newSoftKey(t), code); rec.Code != http.StatusNoContent {
+		t.Fatalf("Code nach abgelehntem Versuch: %d %s", rec.Code, rec.Body)
+	}
+	if rec := newBrowser(s).login(t, adminKey, flagUP|flagUV); rec.Code != http.StatusNoContent {
+		t.Fatalf("Admin ausgesperrt: %d %s", rec.Code, rec.Body)
+	}
+}
+
 func sessionUserOf(t *testing.T, s *server, b *browser) (int64, string, bool) {
 	t.Helper()
 	c := b.cookies[s.cookieName(sessionCookie)]

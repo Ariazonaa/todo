@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+)
 
 // Saved settings must survive a restart — all values, not just some.
 func TestSettingsSaveSurvivesRestart(t *testing.T) {
@@ -123,5 +128,78 @@ func TestNoteLangWritesOnlyOnChange(t *testing.T) {
 func TestValidateSettingsRejectsLocalTZ(t *testing.T) {
 	if validateSettings(appSettings{TZ: "Local", DigestTime: "09:00", ArchiveDays: 30}) == nil {
 		t.Fatal(`expected error for TZ "Local"`)
+	}
+}
+
+// The webhook URL is a credential: whoever has it can post to the channel
+// (with any name), rename or delete the webhook — even after "sign out
+// everywhere". A stolen session cookie must not be able to read it, neither
+// from the settings nor from a backup. The form gets the URL with the token
+// masked; sending that back (or leaving the field out) keeps the webhook.
+func TestSettingsDoNotRevealWebhook(t *testing.T) {
+	s := testServer(t)
+	hook := "https://discord.com/api/webhooks/123456/geheimes-token"
+	if err := s.store.save(testUID, appSettings{WebhookURL: hook, TZ: "Europe/Berlin", DigestTime: "09:00"}); err != nil {
+		t.Fatal(err)
+	}
+	rec := serveAuthed(s, s.handleGetSettings, staleRequest(t, s, testUID, "GET", ""))
+	var got struct {
+		WebhookURL string `json:"webhook_url"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &got)
+	if strings.Contains(rec.Body.String(), "geheimes-token") {
+		t.Fatalf("Einstellungen verraten den Webhook: %s", rec.Body)
+	}
+	if !strings.Contains(got.WebhookURL, "/123456/") {
+		t.Fatalf("Webhook nicht wiederzuerkennen: %q", got.WebhookURL)
+	}
+	for name, body := range map[string]string{
+		"maskiert zurück": `{"webhook_url":"` + got.WebhookURL + `","tz":"Europe/Vienna","digest_time":"08:00","archive_days":30}`,
+		"ohne Feld":       `{"tz":"Europe/Vienna","digest_time":"08:00","archive_days":30}`,
+	} {
+		if rec := serveAuthed(s, s.handlePutSettings, staleRequest(t, s, testUID, "PUT", body)); rec.Code != http.StatusOK {
+			t.Fatalf("%s mit alter Sitzung: %d %s", name, rec.Code, rec.Body)
+		}
+		if cur := s.store.get(testUID).WebhookURL; cur != hook {
+			t.Fatalf("%s: Webhook verändert zu %q", name, cur)
+		}
+	}
+	if rec := call(t, s.handleExport, http.MethodGet, "/", nil); strings.Contains(rec.Body.String(), "geheimes-token") {
+		t.Fatal("Backup enthält den Webhook")
+	}
+}
+
+// The mask hides the token in every URL form Discord accepts — also with a
+// suffix (/slack, /github), a trailing slash or an API version.
+func TestMaskWebhookHidesTokenInEveryForm(t *testing.T) {
+	for _, raw := range []string{
+		"https://discord.com/api/webhooks/123/tok",
+		"https://discord.com/api/webhooks/123/tok/slack",
+		"https://discord.com/api/webhooks/123/tok//",
+		"https://discord.com/api/v10/webhooks/123/tok?wait=true",
+		"https://discord.com/irgendwas/tok",
+	} {
+		if got := maskWebhook(raw); strings.Contains(got, "tok") {
+			t.Errorf("%s → %s", raw, got)
+		}
+	}
+	if got := maskWebhook("https://discord.com/api/webhooks/123/tok/slack"); !strings.Contains(got, "/123/") {
+		t.Errorf("Webhook-ID fehlt in %q", got)
+	}
+}
+
+// A form opened before the webhook changed elsewhere sends the old mask
+// back: that's never a webhook URL, it keeps the current one.
+func TestStaleWebhookMaskKeepsWebhook(t *testing.T) {
+	s := testServer(t)
+	hook := "https://discord.com/api/webhooks/2/neu"
+	s.store.save(testUID, appSettings{WebhookURL: hook, TZ: "Europe/Berlin", DigestTime: "09:00"})
+	body := `{"webhook_url":"https://discord.com/api/webhooks/1/…","tz":"Europe/Berlin","digest_time":"09:00","archive_days":30}`
+	rec := call(t, s.handlePutSettings, "PUT", "/", strings.NewReader(body))
+	if rec.Code != http.StatusOK || s.store.get(testUID).WebhookURL != hook {
+		t.Fatalf("alte Maske: %d, Webhook jetzt %q", rec.Code, s.store.get(testUID).WebhookURL)
+	}
+	if strings.Contains(rec.Body.String(), "neu") {
+		t.Fatalf("Antwort verrät den Webhook: %s", rec.Body)
 	}
 }

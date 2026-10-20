@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -148,6 +149,20 @@ func TestClientIPIgnoresRealIPFromPublicPeer(t *testing.T) {
 		req.RemoteAddr = proxy
 		if got := clientIP(req); got != "198.51.100.1" {
 			t.Fatalf("Proxy %s: X-Real-IP ignoriert (%q)", proxy, got)
+		}
+	}
+}
+
+// Only an address counts as X-Real-IP. A proxy that passes the client's
+// header through unchanged (Caddy without header_up) let everyone pick a
+// fresh bucket per request — and a key up to the header limit in size.
+func TestClientIPIgnoresRealIPThatIsNoAddress(t *testing.T) {
+	for _, real := range []string{"kein-ip", "203.0.113.9, 198.51.100.1", strings.Repeat("a", 100_000)} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "10.0.0.2:1"
+		req.Header.Set("X-Real-IP", real)
+		if got := clientIP(req); got != "10.0.0.2" {
+			t.Fatalf("X-Real-IP %.20q: Schlüssel %.40q, erwartet die Adresse des Proxys", real, got)
 		}
 	}
 }

@@ -1485,13 +1485,14 @@ function renderInvites() {
     const text = el('div', 'invite-text', t('invite.text', { owner: inv.owner_name, name: inv.name ?? t('lists.default') }));
     const answer = (btn, call) => btn.addEventListener('click', () => busy(btn, async () => {
       const r = await call();
-      if (await failed(r)) return;
+      if (!r || await failed(r)) return;
       lastRendered = '';
       await loadTasks();
     }).catch(() => {}));
     const accept = el('button', 'textbtn strong', t('invite.accept'));
     accept.type = 'button';
-    answer(accept, () => api(`/api/lists/${inv.list_id}/accept`, { method: 'POST' }));
+    // Accepting needs a fresh confirmation, like inviting (requireFreshAuth)
+    answer(accept, () => withReauth(() => api(`/api/lists/${inv.list_id}/accept`, { method: 'POST' })));
     const decline = el('button', 'textbtn', t('invite.decline'));
     decline.type = 'button';
     answer(decline, async () => api(`/api/lists/${inv.list_id}/members/${await myId()}`, { method: 'DELETE' }));
@@ -1786,7 +1787,8 @@ function fmtDateNum(iso) {
   return isNaN(d) ? '' : new Intl.DateTimeFormat(FMT_LOCALE, { day: '2-digit', month: '2-digit', year: 'numeric' }).format(d);
 }
 
-// Managing passkeys, accounts, sharing, the webhook and importing require a
+// Managing passkeys, accounts, sharing (inviting and accepting), the webhook,
+// a new push device and importing require a
 // fresh confirmation (requireFreshAuth on the server): if the last sign-in
 // was too long ago, it responds with {"reauth": true}. Then confirm once
 // more via passkey and retry — a hijacked session cookie alone isn't enough
@@ -1957,13 +1959,21 @@ $('#set-sound').addEventListener('click', () => {
   if (off) playPop(); // let them hear it right away when turning it on
 });
 
+// The server only shows the webhook with its token masked: the form sends
+// webhook_url only once it differs from what was shown.
+let shownWebhook = '';
+function showWebhook(url) {
+  shownWebhook = url;
+  $('#set-webhook').value = url;
+}
+
 $('#open-settings').addEventListener('click', async () => {
   syncSoundSwitch();
   try {
     const res = await api('/api/settings');
     if (!res.ok) { toast(t('settings.load_failed')); return; }
     const s = await res.json();
-    $('#set-webhook').value = s.webhook_url;
+    showWebhook(s.webhook_url);
     $('#set-tz').value = s.tz;
     $('#set-digest').value = s.digest_time;
     $('#set-archive').value = s.archive_days;
@@ -1987,16 +1997,18 @@ $('#close-settings').addEventListener('click', () => dlg.close());
 $('#settings-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = {
-    webhook_url: $('#set-webhook').value.trim(),
     tz: $('#set-tz').value.trim(),
     digest_time: $('#set-digest').value,
     archive_days: Number($('#set-archive').value),
   };
+  const hook = $('#set-webhook').value.trim();
+  if (hook !== shownWebhook) body.webhook_url = hook;
   try {
     // A changed webhook needs a fresh confirmation (where task titles go)
     const res = await withReauth(() => api('/api/settings', { method: 'PUT', body: JSON.stringify(body) }));
     if (!res) return;
     if (await failed(res, t('task.save_failed'))) return;
+    showWebhook((await res.json()).webhook_url);
     toast(t('task.saved'));
     loadTasks(); // time zone can change sorting/today
   } catch {}
@@ -2085,31 +2097,51 @@ async function currentSubscription() {
 
 // subscribeFresh subscribes the device with the server's current key —
 // a subscription with an old key (e.g. after moving via backup) gets replaced.
+// old: the endpoint it replaced — the server takes the new subscription as
+// that device's successor instead of a new device.
 async function subscribeFresh() {
   const reg = await navigator.serviceWorker.ready;
   const key = await serverPushKey();
   let sub = await reg.pushManager.getSubscription();
+  let old = '';
   if (sub && !sameKey(sub.options.applicationServerKey, key)) {
+    old = sub.endpoint;
     await sub.unsubscribe();
     sub = null;
   }
-  return sub || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  return { sub: sub || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }), old };
 }
 
-async function sendSubscription(sub) {
-  const res = await api('/api/push/subscription', { method: 'PUT', body: JSON.stringify(sub.toJSON()) });
-  return res.ok ? null : res;
+function putSubscription({ sub, old }) {
+  return api('/api/push/subscription', { method: 'PUT', body: JSON.stringify({ ...sub.toJSON(), old_endpoint: old }) });
 }
 
 async function enablePush() {
+  // A new device needs a fresh confirmation (requireFreshAuth): with a
+  // stolen session cookie alone, nobody gets task titles sent to them. It's
+  // asked first, before the permission prompt — Safari allows only one
+  // prompt per tap, so after confirming it takes a second tap.
+  const check = await api('/api/auth/fresh');
+  if (check.status === 403 && (await check.json().catch(() => ({}))).reauth) {
+    try {
+      await reauth();
+    } catch (ex) {
+      if (ex.name !== 'NotAllowedError') toast(ex.message || t('passkeys.confirm_failed'));
+      return;
+    }
+    toast(t('push.tap_again'));
+    return;
+  }
   if ((await Notification.requestPermission()) !== 'granted') return; // syncPushUI shows "blocked"
-  const sub = await subscribeFresh();
-  const bad = await sendSubscription(sub);
-  if (bad) {
-    // The server rejects the device (e.g. an unsupported push service):
-    // otherwise the toggle would stay "on" even though nothing is subscribed.
-    await sub.unsubscribe().catch(() => {});
-    await failed(bad, t('push.failed'));
+  const fresh = await subscribeFresh();
+  // withReauth all the same: the confirmation can lapse while the permission
+  // prompt is open.
+  const res = await withReauth(() => putSubscription(fresh));
+  if (!res || !res.ok) {
+    // Rejected (e.g. an unsupported push service) or not confirmed: otherwise
+    // the toggle would stay "on" even though nothing is subscribed.
+    await fresh.sub.unsubscribe().catch(() => {});
+    if (res) await failed(res, t('push.failed'));
   }
 }
 
@@ -2167,12 +2199,21 @@ $('#push-test').addEventListener('click', async () => {
 });
 
 // Self-healing on load: after "sign out everywhere", a move via backup, or a
-// new server key, the device quietly re-subscribes as long as permission
-// is still granted.
+// new server key, the device re-subscribes as long as permission is still
+// granted — without asking if the server still knows the device or the
+// sign-in was just now (requireFreshAuth for new devices).
 async function healPush() {
   if (!pushSupported || Notification.permission !== 'granted') return;
   if (!(await currentSubscription())) return;
-  await sendSubscription(await subscribeFresh());
+  const fresh = await subscribeFresh();
+  const res = await putSubscription(fresh);
+  // A device the server doesn't know (anymore) needs a confirmation, which
+  // only switching push on asks for — until then it's off here instead of
+  // looking subscribed, and the person learns why reminders stopped.
+  if (res.status === 403 && (await res.json().catch(() => ({}))).reauth) {
+    await fresh.sub.unsubscribe().catch(() => {});
+    toast(t('push.reenable'));
+  }
 }
 healPush().catch(() => {});
 

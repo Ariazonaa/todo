@@ -9,8 +9,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,7 +97,16 @@ func (k *softKey) cose(t *testing.T) []byte {
 // with UP and UV).
 func (k *softKey) registration(t *testing.T, challenge string) []byte {
 	t.Helper()
-	cdj, _ := json.Marshal(map[string]any{"type": "webauthn.create", "challenge": challenge, "origin": e2eOrigin, "crossOrigin": false})
+	return k.registrationWith(t, challenge, nil, nil)
+}
+
+// registrationWith: like registration, plus what a client may add of its
+// own accord — extra fields in clientDataJSON, a list of transports.
+func (k *softKey) registrationWith(t *testing.T, challenge string, extra map[string]any, transports []string) []byte {
+	t.Helper()
+	cd := map[string]any{"type": "webauthn.create", "challenge": challenge, "origin": e2eOrigin, "crossOrigin": false}
+	maps.Copy(cd, extra)
+	cdj, _ := json.Marshal(cd)
 	rpHash := sha256.Sum256([]byte(e2eHost))
 	var ad bytes.Buffer
 	ad.Write(rpHash[:])
@@ -109,14 +120,39 @@ func (k *softKey) registration(t *testing.T, challenge string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
+	response := map[string]any{
+		"clientDataJSON":    b64u.EncodeToString(cdj),
+		"attestationObject": b64u.EncodeToString(att),
+	}
+	if transports != nil {
+		response["transports"] = transports
+	}
 	body, _ := json.Marshal(map[string]any{
 		"id": b64u.EncodeToString(k.id), "rawId": b64u.EncodeToString(k.id), "type": "public-key",
-		"response": map[string]any{
-			"clientDataJSON":    b64u.EncodeToString(cdj),
-			"attestationObject": b64u.EncodeToString(att),
-		},
+		"response": response,
 	})
 	return body
+}
+
+// addPasskeyChallenge starts adding a passkey from the logged-in session
+// (control panel) and returns the challenge.
+func (b *browser) addPasskeyChallenge(t *testing.T) string {
+	t.Helper()
+	begin := b.do(http.MethodPost, "/api/passkeys/begin", nil)
+	var opt struct {
+		PublicKey struct{ Challenge string } `json:"publicKey"`
+	}
+	if err := json.Unmarshal(begin.Body.Bytes(), &opt); err != nil || opt.PublicKey.Challenge == "" {
+		t.Fatalf("passkeys/begin: %d %s", begin.Code, begin.Body)
+	}
+	return opt.PublicKey.Challenge
+}
+
+// addPasskey registers k as a further passkey of the logged-in account;
+// returns finish's response.
+func (b *browser) addPasskey(t *testing.T, k *softKey) *httptest.ResponseRecorder {
+	t.Helper()
+	return b.do(http.MethodPost, "/api/passkeys/finish", k.registration(t, b.addPasskeyChallenge(t)))
 }
 
 // setup registers k via /setup with code code; returns finish's response.
@@ -417,5 +453,83 @@ func TestLoginCannotBeReplayedAfterGarbageFinishes(t *testing.T) {
 	}
 	if c := replay(); c == http.StatusNoContent {
 		t.Fatalf("Wiederholung nach %d Müll-finish angenommen", maxUsedCeremonies)
+	}
+}
+
+// Every login parses the passkeys of the whole instance: an account must
+// not be able to add any number of them. Begin refuses at the limit
+// (TestPasskeyLimitIsCheckedBeforeTheCeremony); two devices that started
+// with one place left are decided by the INSERT.
+func TestPasskeysPerAccountAreLimited(t *testing.T) {
+	s, b := e2eSetup(t)
+	key := newSoftKey(t)
+	key.store(t, s, true)
+	for range maxPasskeysPerUser - 2 {
+		newSoftKey(t).store(t, s, true)
+	}
+	other := newBrowser(s)
+	for _, br := range []*browser{b, other} {
+		if rec := br.login(t, key, flagUP|flagUV); rec.Code != http.StatusNoContent {
+			t.Fatalf("login: %d %s", rec.Code, rec.Body)
+		}
+	}
+	first, second := b.addPasskeyChallenge(t), other.addPasskeyChallenge(t)
+	if rec := b.do(http.MethodPost, "/api/passkeys/finish", newSoftKey(t).registration(t, first)); rec.Code != http.StatusNoContent {
+		t.Fatalf("letzter erlaubter Passkey: %d %s", rec.Code, rec.Body)
+	}
+	if rec := other.do(http.MethodPost, "/api/passkeys/finish", newSoftKey(t).registration(t, second)); rec.Code != http.StatusConflict {
+		t.Fatalf("Passkey über dem Limit: %d, erwartet 409", rec.Code)
+	}
+	if n, _ := countCredentials(s.db, testUID); n != maxPasskeysPerUser {
+		t.Fatalf("%d Passkeys gespeichert, erwartet %d", n, maxPasskeysPerUser)
+	}
+}
+
+// What a registration sends beyond the key itself is the client's to
+// choose — client data, attestation, made-up transports. It used to be
+// stored in full, and every login of anyone parses it again.
+func TestRegistrationStoresOnlyThePasskey(t *testing.T) {
+	s, b := e2eSetup(t)
+	key := newSoftKey(t)
+	key.store(t, s, true)
+	if rec := b.login(t, key, flagUP|flagUV); rec.Code != http.StatusNoContent {
+		t.Fatalf("login: %d %s", rec.Code, rec.Body)
+	}
+	padded := newSoftKey(t)
+	body := padded.registrationWith(t, b.addPasskeyChallenge(t),
+		map[string]any{"pad": strings.Repeat("x", 30000)}, []string{"usb", strings.Repeat("y", 10000)})
+	if rec := b.do(http.MethodPost, "/api/passkeys/finish", body); rec.Code != http.StatusNoContent {
+		t.Fatalf("Registrierung: %d %s", rec.Code, rec.Body)
+	}
+	var data string
+	if err := s.db.QueryRow("SELECT data FROM credentials ORDER BY id DESC LIMIT 1").Scan(&data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data) > 2000 {
+		t.Fatalf("gespeicherter Passkey %d Byte groß", len(data))
+	}
+	if !strings.Contains(data, `"usb"`) {
+		t.Fatalf("bekannter Transport verloren: %s", data)
+	}
+	if rec := newBrowser(s).login(t, padded, flagUP|flagUV); rec.Code != http.StatusNoContent {
+		t.Fatalf("Login mit dem neuen Passkey: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// The limit is already checked at begin: at finish, the authenticator has
+// created a passkey for good — it would stay behind in the password manager
+// as a dead entry.
+func TestPasskeyLimitIsCheckedBeforeTheCeremony(t *testing.T) {
+	s, b := e2eSetup(t)
+	key := newSoftKey(t)
+	key.store(t, s, true)
+	for range maxPasskeysPerUser - 1 {
+		newSoftKey(t).store(t, s, true)
+	}
+	if rec := b.login(t, key, flagUP|flagUV); rec.Code != http.StatusNoContent {
+		t.Fatalf("login: %d %s", rec.Code, rec.Body)
+	}
+	if rec := b.do(http.MethodPost, "/api/passkeys/begin", nil); rec.Code != http.StatusConflict {
+		t.Fatalf("begin am Limit: %d, erwartet 409", rec.Code)
 	}
 }

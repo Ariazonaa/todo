@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/netip"
@@ -139,7 +140,13 @@ func clientIP(r *http.Request) string {
 	}
 	if real := r.Header.Get("X-Real-IP"); real != "" {
 		if peer, err := netip.ParseAddr(ip); err == nil && (peer.IsLoopback() || peer.IsPrivate()) {
-			ip = real
+			// Only an address counts — otherwise a key as large as the header
+			// limit. A proxy that passes the client's header through unchanged
+			// (Caddy without header_up, see README) still lets every client
+			// pick its own address; only the proxy can fix that.
+			if a, err := netip.ParseAddr(real); err == nil {
+				ip = a.String()
+			}
 		}
 	}
 	if a, err := netip.ParseAddr(ip); err == nil && a.Is6() && !a.Is4In6() {
@@ -148,4 +155,68 @@ func clientIP(r *http.Request) string {
 		}
 	}
 	return ip
+}
+
+// waitSlots: like userSlots, but a request waits for its turn instead of
+// being turned away — for what the app requests on its own (the list after
+// every change, the image the lightbox shows), where a 429 would only
+// break the page. perUser per person, total across everyone; the wait ends
+// with the request's context (client gone).
+type waitSlots struct {
+	mu      sync.Mutex
+	users   map[int64]*userQueue
+	perUser int
+	total   chan struct{}
+}
+
+type userQueue struct {
+	slots chan struct{}
+	refs  int // holding or waiting — the entry goes once nobody is left
+}
+
+func newWaitSlots(perUser, total int) *waitSlots {
+	return &waitSlots{users: map[int64]*userQueue{}, perUser: perUser, total: make(chan struct{}, total)}
+}
+
+// acquire waits for a slot of uid, then for one overall. If ok, release
+// must be called exactly once.
+func (ws *waitSlots) acquire(ctx context.Context, uid int64) (release func(), ok bool) {
+	// select picks at random among ready cases: a request whose client is
+	// already gone could otherwise still take a free slot.
+	if ctx.Err() != nil {
+		return nil, false
+	}
+	ws.mu.Lock()
+	q := ws.users[uid]
+	if q == nil {
+		q = &userQueue{slots: make(chan struct{}, ws.perUser)}
+		ws.users[uid] = q
+	}
+	q.refs++
+	ws.mu.Unlock()
+	leave := func() {
+		ws.mu.Lock()
+		if q.refs--; q.refs == 0 {
+			delete(ws.users, uid)
+		}
+		ws.mu.Unlock()
+	}
+	select {
+	case q.slots <- struct{}{}:
+	case <-ctx.Done():
+		leave()
+		return nil, false
+	}
+	select {
+	case ws.total <- struct{}{}:
+	case <-ctx.Done():
+		<-q.slots
+		leave()
+		return nil, false
+	}
+	return func() {
+		<-ws.total
+		<-q.slots
+		leave()
+	}, true
 }

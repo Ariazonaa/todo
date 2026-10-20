@@ -385,3 +385,31 @@ func TestMemberCannotUnlinkHiddenLink(t *testing.T) {
 		t.Fatalf("Verknüpfung gelöscht (Antwort %d)", rec.Code)
 	}
 }
+
+// Accepting an invitation is lasting access the other way round: with
+// Bea's stolen cookie, the thief accepts an invitation into a list of his
+// own and moves her tasks there — they're his after "sign out everywhere"
+// too. Like inviting, it needs a fresh login.
+func TestAcceptingInviteNeedsFreshAuth(t *testing.T) {
+	s := testServer(t)
+	bea := mustUser(t, s, "Bea")
+	haus := mustList(t, s, "Haushalt")
+	if rec := invite(t, s, testUID, haus.ID, bea); rec.Code != http.StatusNoContent {
+		t.Fatalf("einladen: %d %s", rec.Code, rec.Body)
+	}
+	rec := serveAuthed(s, s.handleAcceptInvite, staleRequest(t, s, bea, "POST", "", "id", fmt.Sprint(haus.ID)))
+	var body map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &body)
+	if rec.Code != http.StatusForbidden || body["reauth"] != true {
+		t.Fatalf("annehmen mit alter Sitzung: %d %s, erwartet 403 reauth", rec.Code, rec.Body)
+	}
+	if listVisible(s.db, bea, haus.ID) {
+		t.Fatal("Liste trotz 403 angenommen")
+	}
+	if rec := callAs(t, bea, s.handleAcceptInvite, "POST", "/", nil, "id", fmt.Sprint(haus.ID)); rec.Code != http.StatusNoContent {
+		t.Fatalf("annehmen frisch angemeldet: %d %s", rec.Code, rec.Body)
+	}
+	if !listVisible(s.db, bea, haus.ID) {
+		t.Fatal("Liste nach dem Annehmen nicht sichtbar")
+	}
+}
