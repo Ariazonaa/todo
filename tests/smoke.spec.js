@@ -821,3 +821,31 @@ test('Abmelden und wieder per Passkey anmelden', async () => {
   await expect(page).toHaveURL(/\/$/);
   await expect(page.locator('#list li.task', { hasText: 'Umzug' })).toHaveCount(1);
 });
+
+// The import sends the file itself as the request body (it used to read it
+// into a string first, which fails beyond the browser's string limit): a
+// backup of this very instance must go through and bring its tasks back.
+test('Backup exportieren und wieder importieren', async ({}, testInfo) => {
+  const res = await page.request.get('/api/export');
+  expect(res.ok()).toBeTruthy();
+  const file = testInfo.outputPath('backup.json');
+  fs.writeFileSync(file, await res.body());
+
+  await page.click('#open-settings');
+  await expect(page.locator('#settings')).toBeVisible();
+  await page.setInputFiles('#import-file', file);
+  await page.click('#confirm-ok');
+  await expect(page.locator('#toast')).toHaveText('Backup importiert');
+  await page.click('#close-settings');
+  await expect(page.locator('#list li.task', { hasText: 'Umzug' })).toHaveCount(1);
+
+  // Not a backup: turned away before anything is sent
+  const junk = testInfo.outputPath('junk.json');
+  fs.writeFileSync(junk, 'kein Backup');
+  await page.click('#open-settings');
+  await expect(page.locator('#settings')).toBeVisible();
+  await page.setInputFiles('#import-file', junk);
+  await page.click('#confirm-ok');
+  await expect(page.locator('#toast')).toHaveText('Datei ist kein gültiges Backup');
+  await page.click('#close-settings');
+});

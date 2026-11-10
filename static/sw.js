@@ -1,5 +1,5 @@
 // Bump this on every frontend change, otherwise offline usage gets stuck on the old version.
-const CACHE = 'todo-v47';
+const CACHE = 'todo-v48';
 const ASSETS = [
   '/style.css',
   '/i18n.js',

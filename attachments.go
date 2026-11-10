@@ -193,12 +193,11 @@ func attachmentBelongsToTask(db *sql.DB, uid, attachmentID, taskID int64) (bool,
 }
 
 // overImageLimit: would size more bytes of images put the owner of list over
-// maxAttachmentBytesPerOwner? SUM(length()) doesn't read the image data.
+// maxAttachmentBytesPerOwner? Only an early answer, before the upload is
+// read or decoded — what counts is the check in insertAttachment.
 func (s *server) overImageLimit(list, size int64) (bool, error) {
 	var used int64
-	err := s.db.QueryRow("SELECT COALESCE(SUM(length(data)), 0) FROM attachments WHERE task_id IN "+
-		"(SELECT id FROM tasks WHERE list_id IN (SELECT id FROM lists WHERE owner_id = (SELECT owner_id FROM lists WHERE id = ?)))",
-		list).Scan(&used)
+	err := s.db.QueryRow("SELECT "+ownerImageBytes("?"), list).Scan(&used)
 	return used+size > maxAttachmentBytesPerOwner, err
 }
 
@@ -291,28 +290,59 @@ func (s *server) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	thumb, _ := makeThumb(data) // error ok: /thumb then serves the original
-	// The task may have been deleted during the upload (seconds, for
-	// 15 MB). Without the check in the INSERT itself, the image would be
-	// left behind as an orphan.
-	res, err := s.db.Exec("INSERT INTO attachments (task_id, mime, created_at, data, thumb) "+
-		"SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND list_id "+visibleLists+")",
-		t.ID, mime, time.Now().UTC().Format(time.RFC3339), data, thumb, t.ID, uid)
-	if err != nil {
-		// The attachments_limit trigger aborts with RAISE(ABORT, …)
-		if strings.Contains(err.Error(), "attachment limit reached") {
-			writeError(w, r, http.StatusConflict, "error.max_images", "n", maxAttachmentsPerTask)
-		} else {
-			writeError(w, r, http.StatusInternalServerError, "error.internal")
-		}
+	id, err := insertAttachment(s.db, uid, t.ID, mime, data, thumb)
+	switch {
+	case errors.Is(err, errStorageLimit):
+		writeError(w, r, http.StatusConflict, "error.storage_limit", "n", maxAttachmentBytesPerOwner>>20)
 		return
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	case errors.Is(err, sql.ErrNoRows):
 		writeError(w, r, http.StatusNotFound, "error.task_not_found")
 		return
+	case err != nil && strings.Contains(err.Error(), "attachment limit reached"):
+		// The attachments_limit trigger aborts with RAISE(ABORT, …)
+		writeError(w, r, http.StatusConflict, "error.max_images", "n", maxAttachmentsPerTask)
+		return
+	case err != nil:
+		writeError(w, r, http.StatusInternalServerError, "error.internal")
+		return
 	}
-	id, _ := res.LastInsertId()
 	s.changed(userID(r))
 	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+}
+
+// errStorageLimit: the image would put the list's owner over
+// maxAttachmentBytesPerOwner.
+var errStorageLimit = errors.New("image storage limit reached")
+
+// ownerImageBytes: SQL for the image bytes in all lists of the owner of the
+// list given by the SQL expression list. SUM(length()) doesn't read the
+// image data.
+func ownerImageBytes(list string) string {
+	return "(SELECT COALESCE(SUM(length(data)), 0) FROM attachments WHERE task_id IN " +
+		"(SELECT id FROM tasks WHERE list_id IN (SELECT id FROM lists WHERE owner_id = (SELECT owner_id FROM lists WHERE id = " + list + "))))"
+}
+
+// insertAttachment stores an image on task for uid. sql.ErrNoRows: the task
+// is gone or no longer visible to uid. Both rules — the task still exists,
+// the owner stays within maxAttachmentBytesPerOwner — are part of the INSERT
+// itself: the task may have been deleted during the upload (seconds, for
+// 15 MB), leaving the image behind as an orphan, and of two uploads checked
+// one after the other and written side by side, both got past the limit.
+func insertAttachment(db *sql.DB, uid, task int64, mime string, data, thumb []byte) (int64, error) {
+	res, err := db.Exec("INSERT INTO attachments (task_id, mime, created_at, data, thumb) "+
+		"SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND list_id "+visibleLists+") "+
+		"AND "+ownerImageBytes("(SELECT list_id FROM tasks WHERE id = ?)")+" + ? <= ?",
+		task, mime, time.Now().UTC().Format(time.RFC3339), data, thumb, task, uid, task, len(data), maxAttachmentBytesPerOwner)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := taskFor(db, uid, task); err != nil {
+			return 0, err // sql.ErrNoRows: gone
+		}
+		return 0, errStorageLimit
+	}
+	return res.LastInsertId()
 }
 
 func (s *server) handleAttachmentGet(w http.ResponseWriter, r *http.Request) {

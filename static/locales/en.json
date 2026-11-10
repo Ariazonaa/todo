@@ -341,7 +341,7 @@
   "error.image_pixels": "Image can't be processed (too many pixels: {w}x{h})",
   "error.image_not_found": "Image not found",
   "error.max_images": "at most {n} images per task",
-  "error.storage_limit": "no more room for images (at most {n} GB)",
+  "error.storage_limit": "no more room for images (at most {n} MB)",
   "error.uploads_busy": "too many uploads at the moment — please try again shortly",
   "error.link_limit": "at most {n} links per task",
   "error.task_limit": "too many tasks (at most {n})",

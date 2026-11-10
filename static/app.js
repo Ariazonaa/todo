@@ -1792,7 +1792,8 @@ function fmtDateNum(iso) {
 // fresh confirmation (requireFreshAuth on the server): if the last sign-in
 // was too long ago, it responds with {"reauth": true}. Then confirm once
 // more via passkey and retry — a hijacked session cookie alone isn't enough
-// this way. Only this account's passkeys count, and the session stays.
+// this way. Only this account's passkeys count; the server answers with a
+// new session for the same account (the old cookie expires within a minute).
 async function reauth() {
   toast(t('passkeys.reauth'));
   await passkeyReauth();
@@ -2290,11 +2291,16 @@ $('#import-file').addEventListener('change', async () => {
   $('#import-file').value = '';
   if (!file) return;
   if (!(await confirmDlg(t('backup.import_confirm'), t('backup.import_ok')))) return;
-  let text;
+  // Only a glance at the start — the server validates the backup. Reading
+  // the file into a string to parse it here failed for every backup beyond
+  // the browser's string limit (~500 MB in Chrome, a backup holds up to
+  // 1.7 GB of images) with "not a valid backup", and took the tab's memory
+  // with it well below that.
+  let start = '';
   try {
-    text = await file.text();
-    JSON.parse(text); // fail early on a broken file
-  } catch {
+    start = await file.slice(0, 64).text();
+  } catch {}
+  if (!start.replace(/^﻿/, '').trimStart().startsWith('{')) {
     toast(t('backup.invalid_file'));
     return;
   }
@@ -2305,7 +2311,8 @@ $('#import-file').addEventListener('change', async () => {
     const fresh = await withReauth(() => api('/api/auth/fresh'));
     if (!fresh) return;
     if (await failed(fresh)) return;
-    const res = await api('/api/import', { method: 'POST', body: text });
+    // The file itself as the body: the browser streams it from disk.
+    const res = await api('/api/import', { method: 'POST', body: file });
     if (await failed(res, t('error.import_failed'))) return;
     toast(t('backup.imported'));
     loadTasks();

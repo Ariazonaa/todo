@@ -152,7 +152,7 @@ func (s *scheduler) exactReminders(uid int64, webhook, today, hhmm string) {
 	var sent []Task
 	size := 0
 	for _, t := range due {
-		line := T(lang, "notify.ping_line", "title", notifyTitle(t), "time", *t.DueTime)
+		line := T(lang, "notify.ping_line", "title", discordTitle(t), "time", *t.DueTime)
 		if *t.DueDate < today {
 			line += T(lang, "notify.ping_overdue", "date", formatDate(lang, *t.DueDate))
 		}
@@ -218,11 +218,11 @@ func (s *scheduler) morningDigest(uid int64, webhook, digestTime, today, hhmm st
 	lang := s.store.notifyLang(uid)
 	var entries []digestEntry
 	for _, t := range dueToday {
-		entries = append(entries, digestEntry{T(lang, "notify.digest_today"), "• " + notifyTitle(t)})
+		entries = append(entries, digestEntry{T(lang, "notify.digest_today"), "• " + discordTitle(t)})
 	}
 	for _, t := range overdue {
 		entries = append(entries, digestEntry{T(lang, "notify.digest_overdue"),
-			T(lang, "notify.digest_overdue_line", "title", notifyTitle(t), "date", formatDate(lang, *t.DueDate))})
+			T(lang, "notify.digest_overdue_line", "title", discordTitle(t), "date", formatDate(lang, *t.DueDate))})
 	}
 	msg := digestMessage(lang, T(lang, "notify.digest_title", "date", formatDate(lang, today)), entries)
 	if err := postDiscord(webhook, msg); err != nil {
@@ -422,6 +422,17 @@ func notifyTitle(t Task) string {
 	}
 	return t.Title
 }
+
+// discordEscaper takes the markdown out of a title that could mislead:
+// titles from a shared list land in the other members' channels, and a
+// masked link ("[Rechnung](https://…)") would show its text, not its target.
+// Brackets, emphasis, code and spoilers — not "_", "(", "#" or "~", which
+// URLs are made of: a bare URL in a title stays a link that shows where it
+// goes.
+var discordEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`, `*`, `\*`, "`", "\\`", `|`, `\|`)
+
+// discordTitle: notifyTitle as plain text for a Discord message.
+func discordTitle(t Task) string { return discordEscaper.Replace(notifyTitle(t)) }
 
 // pushActions builds the buttons with labels in lang.
 func pushActions(lang string, names ...string) []pushAction {

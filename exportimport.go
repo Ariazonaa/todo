@@ -332,6 +332,14 @@ func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusInternalServerError, "error.import_failed")
 			return
 		}
+		if _, tooLong := errors.AsType[fieldTooLongError](err); tooLong {
+			writeError(w, r, http.StatusBadRequest, "error.backup.too_long")
+			return
+		}
+		if errors.Is(err, errStorageLimit) {
+			writeError(w, r, http.StatusConflict, "error.storage_limit", "n", maxAttachmentBytesPerOwner>>20)
+			return
+		}
 		if tooMany, ok := errors.AsType[tooManyError](err); ok {
 			writeError(w, r, http.StatusBadRequest, "error.backup_too_many", "what", tooMany.what)
 			return
@@ -671,15 +679,33 @@ func (l *elemLimit) Read(p []byte) (int, error) {
 	if l.n > l.max {
 		return 0, errElementTooLarge
 	}
+	// Never more than one byte past the limit in one go: a reader that hands
+	// out megabytes per call would otherwise trip the limit on a small
+	// element that merely straddles two reads.
+	if room := l.max - l.n + 1; int64(len(p)) > room {
+		p = p[:room]
+	}
 	k, err := l.r.Read(p)
 	l.n += int64(k)
 	return k, err
 }
 
-func (l *elemLimit) reset() { l.n = 0 }
+// reset starts a new element that may take up to max bytes.
+func (l *elemLimit) reset(max int64) { l.n, l.max = 0, max }
 
-// maxImportElement: the largest image as base64 plus room for its other fields.
-const maxImportElement = maxAttachmentSize/3*4 + 1<<20
+const (
+	// maxImportElement: the largest image as base64 plus room for its other fields.
+	maxImportElement = maxAttachmentSize/3*4 + 1<<20
+	// maxImportSmallElement: everything that isn't an image — a task at full
+	// length (title and note, every character escaped as a surrogate pair) is
+	// ~70 KB.
+	maxImportSmallElement = 256 << 10
+)
+
+// fieldTooLongError: a task's title or note is longer than the API allows.
+type fieldTooLongError struct{}
+
+func (fieldTooLongError) Error() string { return "title or note too long" }
 
 // stageError: a DB error while staging, not a broken backup.
 type stageError struct{ err error }
@@ -688,13 +714,17 @@ func (e stageError) Error() string { return e.err.Error() }
 func (e stageError) Unwrap() error { return e.err }
 
 // readImport reads a backup without loading it entirely into memory: everything
-// except the images is small and gets decoded normally, the images go
-// into the staging area one at a time. Field names are matched case-insensitively,
+// except the images is small (maxImportSmallElement per element, title and
+// note checked as each task is read — checked only afterwards, the tasks sat
+// in memory up to the body limit) and gets decoded normally, the images go
+// into the staging area one at a time, in total at most
+// maxAttachmentBytesPerOwner. Field names are matched case-insensitively,
 // as encoding/json does; unknown fields are skipped.
 func (s *server) readImport(body io.Reader, uid int64) (exportData, error) {
 	var data exportData
-	lim := &elemLimit{r: body, max: maxImportElement}
+	lim := &elemLimit{r: body, max: maxImportSmallElement}
 	dec := json.NewDecoder(lim)
+	var staged int64 // image bytes in the staging area
 	if tok, err := dec.Token(); err != nil {
 		return data, err
 	} else if d, ok := tok.(json.Delim); !ok || d != '{' {
@@ -706,23 +736,25 @@ func (s *server) readImport(body io.Reader, uid int64) (exportData, error) {
 			return data, err
 		}
 		key, _ := tok.(string)
-		lim.reset()
+		lim.reset(maxImportSmallElement)
 		switch strings.ToLower(key) {
 		case "attachments":
-			err = s.stageAttachments(dec, lim, uid)
+			err = s.stageAttachments(dec, lim, uid, &staged)
 		case "exported_at":
 			err = dec.Decode(&data.ExportedAt)
 		case "lists":
-			data.Lists, err = decodeList[exportList](dec, lim, maxLists, "lists")
+			data.Lists, err = decodeList[exportList](dec, lim, maxLists, "lists", nil)
 		case "tasks":
-			data.Tasks, err = decodeList[exportTask](dec, lim, maxImportTasks, "tasks")
+			data.Tasks, err = decodeList(dec, lim, maxImportTasks, "tasks", cleanTaskText)
 		case "links":
-			data.Links, err = decodeList[[2]int64](dec, lim, maxImportLinks, "links")
+			data.Links, err = decodeList[[2]int64](dec, lim, maxImportLinks, "links", nil)
 		case "stats":
 			data.Stats, err = decodeStats(dec, lim)
 		case "settings":
 			err = dec.Decode(&data.Settings)
 		default:
+			// Skipped, never kept: an unknown field may be as large as an image.
+			lim.reset(maxImportElement)
 			var skip json.RawMessage
 			err = dec.Decode(&skip)
 		}
@@ -734,7 +766,21 @@ func (s *server) readImport(body io.Reader, uid int64) (exportData, error) {
 	return data, err
 }
 
-func (s *server) stageAttachments(dec *json.Decoder, lim *elemLimit, uid int64) error {
+// cleanTaskText normalizes a task's title and note as the API does and
+// rejects what's too long for it.
+func cleanTaskText(t *exportTask) error {
+	t.Title = strings.TrimSpace(cleanTitle(t.Title))
+	t.Note = cleanNote(t.Note)
+	if utf8.RuneCountInString(t.Title) > maxTitleLen || utf8.RuneCountInString(t.Note) > maxNoteLen {
+		return fieldTooLongError{}
+	}
+	return nil
+}
+
+// stageAttachments puts the backup's images into the staging area. staged
+// counts their bytes across the whole backup: more than an owner may hold
+// (errStorageLimit) would make the next export too large to import again.
+func (s *server) stageAttachments(dec *json.Decoder, lim *elemLimit, uid int64, staged *int64) error {
 	tok, err := dec.Token()
 	if err != nil {
 		return err
@@ -747,7 +793,7 @@ func (s *server) stageAttachments(dec *json.Decoder, lim *elemLimit, uid int64) 
 	}
 	for dec.More() {
 		var a exportAttachment
-		lim.reset()
+		lim.reset(maxImportElement)
 		if err := dec.Decode(&a); err != nil {
 			return err
 		}
@@ -757,6 +803,9 @@ func (s *server) stageAttachments(dec *json.Decoder, lim *elemLimit, uid int64) 
 		// larger than an upload is ever allowed to be.
 		if len(a.Data) == 0 || len(a.Data) > maxAttachmentSize || !allowedImageMimes[a.Mime] {
 			continue
+		}
+		if *staged += int64(len(a.Data)); *staged > maxAttachmentBytesPerOwner {
+			return errStorageLimit
 		}
 		if _, err := s.db.Exec("INSERT INTO import_attachments (user_id, task_id, mime, created_at, data) VALUES (?, ?, ?, ?, ?)",
 			uid, a.TaskID, a.Mime, normStamp(a.CreatedAt, time.Now().UTC().Format(time.RFC3339)), a.Data); err != nil {
@@ -786,8 +835,9 @@ type tooManyError struct{ what string } // what: field in the backup ("tasks", "
 
 func (e tooManyError) Error() string { return "too many " + e.what }
 
-// decodeList reads a JSON list element by element (null = empty).
-func decodeList[T any](dec *json.Decoder, lim *elemLimit, max int, what string) ([]T, error) {
+// decodeList reads a JSON list element by element (null = empty). check, if
+// given, sees each element before it's kept.
+func decodeList[T any](dec *json.Decoder, lim *elemLimit, max int, what string, check func(*T) error) ([]T, error) {
 	tok, err := dec.Token()
 	if err != nil || tok == nil {
 		return nil, err
@@ -801,9 +851,14 @@ func decodeList[T any](dec *json.Decoder, lim *elemLimit, max int, what string) 
 			return nil, tooManyError{what}
 		}
 		var v T
-		lim.reset()
+		lim.reset(maxImportSmallElement)
 		if err := dec.Decode(&v); err != nil {
 			return nil, err
+		}
+		if check != nil {
+			if err := check(&v); err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, v)
 	}
@@ -811,7 +866,9 @@ func decodeList[T any](dec *json.Decoder, lim *elemLimit, max int, what string) 
 	return out, err
 }
 
-// decodeStats reads the stats object {"YYYY-MM-DD": n} entry by entry.
+// decodeStats reads the stats object {"YYYY-MM-DD": n} entry by entry. Keys
+// that can't be a day are dropped right away (the import would skip them
+// anyway) instead of being kept at whatever length they have.
 func decodeStats(dec *json.Decoder, lim *elemLimit) (map[string]int, error) {
 	tok, err := dec.Token()
 	if err != nil || tok == nil {
@@ -825,7 +882,7 @@ func decodeStats(dec *json.Decoder, lim *elemLimit) (map[string]int, error) {
 		if len(out) >= maxImportStats {
 			return nil, tooManyError{"stats"}
 		}
-		lim.reset()
+		lim.reset(maxImportSmallElement)
 		k, err := dec.Token()
 		if err != nil {
 			return nil, err
@@ -835,7 +892,9 @@ func decodeStats(dec *json.Decoder, lim *elemLimit) (map[string]int, error) {
 		if err := dec.Decode(&n); err != nil {
 			return nil, err
 		}
-		out[key] = n
+		if len(key) == len(dateFmt) {
+			out[key] = n
+		}
 	}
 	_, err = dec.Token() // '}'
 	return out, err

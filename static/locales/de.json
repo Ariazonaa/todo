@@ -341,7 +341,7 @@
   "error.image_pixels": "Bild kann nicht verarbeitet werden (zu viele Pixel: {w}x{h})",
   "error.image_not_found": "Bild nicht gefunden",
   "error.max_images": "maximal {n} Bilder pro Aufgabe",
-  "error.storage_limit": "kein Platz mehr für Bilder (höchstens {n} GB)",
+  "error.storage_limit": "kein Platz mehr für Bilder (höchstens {n} MB)",
   "error.uploads_busy": "gerade laufen zu viele Uploads — bitte gleich nochmal versuchen",
   "error.link_limit": "höchstens {n} Verknüpfungen pro Aufgabe",
   "error.task_limit": "zu viele Aufgaben (höchstens {n})",
