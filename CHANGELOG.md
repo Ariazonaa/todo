@@ -4,6 +4,36 @@ All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/); every release is also published as
 a Docker image `ghcr.io/ariazonaa/todo:X.Y.Z` (plus `:X.Y` and `:X`).
 
+## 1.2.1 — 2026-11-10
+
+### Security
+
+- **Importing a backup can no longer exhaust the server's memory.** A backup
+  with very long titles or notes — crafted or simply broken — was held in
+  memory whole, up to the 2 GB upload limit, and took the server down for
+  everyone. Such a backup is now turned away while it's read.
+- **Task titles sent to Discord no longer render as markdown links.** In a
+  shared list, another member could name a task `[Invoice](https://…)` and
+  have it appear in your channel as a link that hides where it goes.
+- Built with Go 1.26.10, which fixes GO-2026-6809 (compromised intermediate
+  certificates weren't rejected).
+
+### Fixed
+
+- **Large backups can be imported again.** The app read the whole file into
+  memory before sending it; beyond about 500 MB the browser refused and the
+  app reported "not a valid backup".
+- The image limit per account also applies to a backup's images, and two
+  uploads at the same moment can't both slip past it anymore. A backup
+  holding more images than an account may have is refused instead of
+  producing an account whose next backup is too large to import.
+- The "no more room for images" message named the limit in GB instead of MB.
+
+### Changed
+
+- The example nginx config notes what to change when the app isn't served on
+  port 443.
+
 ## 1.2.0 — 2026-10-20
 
 ### Before you update
