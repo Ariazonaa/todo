@@ -4,6 +4,16 @@ All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/); every release is also published as
 a Docker image `ghcr.io/ariazonaa/todo:X.Y.Z` (plus `:X.Y` and `:X`).
 
+## 1.2.2 — 2026-11-18
+
+### Fixed
+
+- **Checking off a task on the iPhone no longer gets stuck.** After the app
+  woke from the background, a request could hang on a dead connection: the
+  task stayed checked in the list, never reached the server, and further
+  taps did nothing until the app was restarted. Requests now give up after
+  10 seconds, the offline banner shows, and the next tap goes through.
+
 ## 1.2.1 — 2026-11-10
 
 ### Security
