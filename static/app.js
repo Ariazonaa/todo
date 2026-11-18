@@ -51,16 +51,29 @@ function indexTasks() {
   }
 }
 
+// API_TIMEOUT: how long a request may wait for the response headers. On iOS
+// after waking from the background, a request on the dead connection used to
+// neither answer nor fail — the task stayed checked, and the double-tap guard
+// (inflight) swallowed every further tap until the app was restarted. Only
+// until the headers: a long task list over a slow network still loads in
+// full. Uploads (a file as the body) wait for the server only once the whole
+// body is sent, so they get no limit.
+const API_TIMEOUT = 10_000;
+
 async function api(path, opts = {}) {
   let res;
+  const ctl = !opts.signal && !(opts.body instanceof Blob) ? new AbortController() : null;
+  const timer = ctl && setTimeout(() => ctl.abort(), API_TIMEOUT);
   try {
     // X-Lang: error messages come back in the app's language, and the server
     // remembers it for notifications (noteLang).
     const headers = { 'Content-Type': 'application/json', ...opts.headers, 'X-Lang': LANG };
-    res = await fetch(path, { ...opts, headers });
+    res = await fetch(path, { ...opts, headers, ...(ctl && { signal: ctl.signal }) });
   } catch (e) {
     $('#offline').hidden = false;
     throw e;
+  } finally {
+    clearTimeout(timer);
   }
   $('#offline').hidden = true;
   if (res.status === 401) {

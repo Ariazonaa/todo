@@ -454,6 +454,45 @@ test('Fehler beim In-Arbeit-Umschalten erscheint als Hinweis', async () => {
   await beruhigen();
 });
 
+// iOS after waking from the background: a request on the dead connection
+// neither answered nor failed. The task stayed checked in the open list, and
+// every further tap was swallowed by the double-tap guard until the app was
+// restarted. Now the request gives up, and the next tap goes through.
+test('Hängende Anfrage blockiert das Abhaken nicht dauerhaft', async () => {
+  test.setTimeout(60_000);
+  await aufgabeAnlegen('Hängt beim ersten Mal');
+  // Like a real fetch on a dead connection: never settles — only an abort
+  // via the signal ends it.
+  await page.evaluate(() => {
+    window.__fetch = window.fetch;
+    let hung = false;
+    window.fetch = (url, opts = {}) => {
+      if (!hung && String(url).endsWith('/complete')) {
+        hung = true;
+        return new Promise((_, fail) => {
+          opts.signal?.addEventListener('abort', () => fail(new DOMException('aborted', 'AbortError')));
+        });
+      }
+      return window.__fetch(url, opts);
+    };
+  });
+  try {
+    const zeile = page.locator('#list section > ul > li.task', { hasText: 'Hängt beim ersten Mal' });
+    await zeile.locator('.check').first().click();
+    await expect(zeile).toHaveClass(/checking/);
+    // gives up instead of hanging forever, and says so
+    await expect(page.locator('#offline')).toBeVisible({ timeout: 20_000 });
+    await expect(zeile).not.toHaveClass(/checking/);
+
+    await zeile.locator('.check').first().click();
+    await expect(page.locator('#list details li.task', { hasText: 'Hängt beim ersten Mal' })).toHaveCount(1);
+    await expect(page.locator('#offline')).toBeHidden();
+  } finally {
+    await page.evaluate(() => { window.fetch = window.__fetch; });
+  }
+  await beruhigen();
+});
+
 // While dragging, the drag used to respond to every finger: lifting a second
 // one ended it mid-move.
 test('Zweiter Finger beendet das Ziehen nicht', async () => {
