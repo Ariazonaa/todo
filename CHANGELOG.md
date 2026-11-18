@@ -6,6 +6,11 @@ a Docker image `ghcr.io/ariazonaa/todo:X.Y.Z` (plus `:X.Y` and `:X`).
 
 ## 1.2.2 — 2026-11-18
 
+### Security
+
+- Built with Go 1.26.11, which fixes GO-2026-6859 (a race in the HTTP/1
+  server could crash it).
+
 ### Fixed
 
 - **Checking off a task on the iPhone no longer gets stuck.** After the app
